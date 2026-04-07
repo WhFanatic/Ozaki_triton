@@ -21,14 +21,15 @@ B → [B1, B2, B3]  ┘
 
 ## 文件说明
 
-- `ozaki_triton.py` — 完整实现，包含分片、Triton matmul kernel、主流程和精度测试
+- `ozaki_triton.py` — 核心实现：分片 (split_matrix)、Triton matmul kernel、Ozaki 主流程
+- `test.py` — 测试脚本：对比 FP32、Naive FP16、Ozaki Scheme 的精度
 
 ## 运行
 
 ```bash
 # 需要 NVIDIA GPU + PyTorch + Triton
 pip install torch triton
-python ozaki_triton.py
+python test.py
 ```
 
 ## 预期输出

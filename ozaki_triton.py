@@ -55,29 +55,28 @@ def split_matrix(A: torch.Tensor, num_splits: int, alpha: int) -> list[tuple[tor
     residual = A.clone().float()
     slices = []
 
+    # 预计算常量
+    extract_const = float(2 ** alpha)  # 2^alpha，用于计算 scale
+    fp16_max = 65504.0
+
     for s in range(num_splits):
-        # 每行的最大绝对值
+        # 每行的最大绝对值，用于确定指数上界
         row_max = residual.abs().amax(dim=-1, keepdim=True).clamp(min=1e-38)
 
-        # 计算缩放因子：将最大值对齐到 2^alpha 范围内
-        # sigma = 2^(floor(log2(row_max)) + 1) 是行最大值的上界幂次
-        log2_max = torch.floor(torch.log2(row_max)) + 1.0
-        sigma = torch.exp2(log2_max)  # 行级指数上界
+        # sigma = 2^exponent 是 row_max 的上界幂次
+        # scale = sigma / 2^alpha = 2^(exponent - alpha)，截断阈值
+        _, exponent = torch.frexp(row_max)
+        sigma = torch.ldexp(torch.ones_like(exponent), exponent.to(torch.int32))
+        scale = sigma / extract_const
 
-        # 截断常数：加上再减去一个大数，利用浮点舍入提取高 alpha 位
-        # 这是 Ozaki 原始论文中的 "extracting" 技巧
-        extract_const = torch.exp2(torch.tensor(alpha, dtype=torch.float32, device=A.device))
-        scale = sigma / extract_const  # 每行缩放因子
-
-        # 提取：缩放 → 舍入 → 截断到 alpha 位
+        # 提取高位：缩放后截断到 alpha 位
         scaled = residual / scale
-        # clamp 到 FP16 安全范围，防止溢出
-        slice_fp32 = scaled.clamp(-65504.0, 65504.0)
+        slice_fp32 = scaled.clamp(-fp16_max, fp16_max)
         slice_fp16 = slice_fp32.to(torch.float16)
 
         slices.append((scale.squeeze(-1), slice_fp16))
 
-        # 更新残差：减去已提取的部分
+        # 更新残差
         residual = residual - slice_fp16.float() * scale
 
     return slices
@@ -204,55 +203,3 @@ def ozaki_matmul(
             C += C_ij
 
     return C
-
-
-# ============================================================
-# 4. 测试与精度对比
-# ============================================================
-
-def test_ozaki():
-    """对比 Ozaki Scheme 与 PyTorch FP32 matmul 和 naive FP16 matmul 的精度。"""
-    torch.manual_seed(42)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    M, K, N = 256, 256, 256
-    A = torch.randn(M, K, dtype=torch.float32, device=device)
-    B = torch.randn(K, N, dtype=torch.float32, device=device)
-
-    # 参考结果：FP32 matmul
-    C_ref = A @ B
-
-    # Naive FP16 matmul（直接截断，精度最差）
-    C_naive_fp16 = (A.half() @ B.half()).float()
-
-    # Ozaki Scheme（不同分片数）
-    print("=" * 60)
-    print("Ozaki Scheme 精度测试")
-    print("=" * 60)
-
-    results = {}
-    for num_splits in [2, 3, 4]:
-        C_ozaki = ozaki_matmul(A, B, num_splits=num_splits)
-
-        # 相对误差
-        rel_err = (C_ozaki - C_ref).norm() / C_ref.norm()
-        max_err = (C_ozaki - C_ref).abs().max()
-        results[num_splits] = (rel_err.item(), max_err.item())
-
-    # Naive FP16 误差
-    naive_rel = (C_naive_fp16 - C_ref).norm() / C_ref.norm()
-    naive_max = (C_naive_fp16 - C_ref).abs().max()
-
-    print("\n" + "-" * 60)
-    print(f"{'方法':<25} {'相对误差':>15} {'最大绝对误差':>15}")
-    print("-" * 60)
-    print(f"{'Naive FP16':<25} {naive_rel.item():>15.6e} {naive_max.item():>15.6e}")
-    for ns, (rel, mx) in results.items():
-        print(f"{'Ozaki (splits=' + str(ns) + ')':<25} {rel:>15.6e} {mx:>15.6e}")
-    print("-" * 60)
-    print(f"{'FP32 (参考)':<25} {'0':>15} {'0':>15}")
-    print()
-
-
-if __name__ == "__main__":
-    test_ozaki()
