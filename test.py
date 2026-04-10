@@ -21,19 +21,18 @@ def test_accuracy():
 
     methods = [
         ("Naive FP16", lambda: (A.half() @ B.half()).float()),
-        ("Ozaki (2)", lambda: ozaki_matmul(A, B, 2)),
-        ("Ozaki (3)", lambda: ozaki_matmul(A, B, 3)),
-        ("Ozaki (4)", lambda: ozaki_matmul(A, B, 4)),
     ]
+    for s in [2, 3, 4]:
+        methods.append((f"Ozaki(split{s})", lambda s=s: ozaki_matmul(A, B, s)))
 
-    print(f"{'方法':<15} {'相对误差':>12} {'最大误差':>12}")
+    print(f"{'方法':<18} {'最大误差':>14} {'相对误差':>14}")
     print("-" * 50)
 
     for name, fn in methods:
         C = fn()
         rel = (C - C_ref).norm() / C_ref.norm()
         mx = (C - C_ref).abs().max()
-        print(f"{name:<15} {rel.item():>12.6e} {mx.item():>12.6e}")
+        print(f"{name:<18} {mx.item():>14.6e} {rel.item():>14.6e}")
     print()
 
 
@@ -44,11 +43,23 @@ def test_performance():
         print("性能测试需要 GPU，跳过")
         return
 
-    print("=" * 60)
+    print("=" * 80)
     print("性能测试")
-    print("=" * 60)
-    print(f"{'尺寸':<10} {'FP32':>10} {'FP16':>10} {'Ozaki(3)':>10} {'slowdown':>10}")
-    print("-" * 60)
+    print("=" * 80)
+
+    splits = [2, 3, 4]
+
+    # 表头第一行
+    header1 = f"{'尺寸':<8} {'FP32':>8} {'FP16':>8}"
+    for s in splits:
+        header1 += f"  Ozaki(split{s})"
+    # 表头第二行
+    header2 = f"{'':<8} {'':>8} {'':>8}"
+    for s in splits:
+        header2 += f" {'time / speedup':>19}"
+    print(header1)
+    print(header2)
+    print("-" * 80)
 
     for size in [512, 1024, 2048]:
         A = torch.randn(size, size, dtype=torch.float32, device=device)
@@ -57,9 +68,13 @@ def test_performance():
 
         t_fp32 = do_bench(lambda: A @ B)
         t_fp16 = do_bench(lambda: A_h @ B_h)
-        t_ozaki = do_bench(lambda: ozaki_matmul(A, B, num_splits=3))
 
-        print(f"{size}x{size:<6} {t_fp32:>10.2f} {t_fp16:>10.2f} {t_ozaki:>10.2f} {t_ozaki/t_fp32:>9.1f}x")
+        row = f"{size}x{size:<6} {t_fp32:>8.2f} {t_fp16:>8.2f}"
+        for s in splits:
+            t_ozaki = do_bench(lambda s=s: ozaki_matmul(A, B, num_splits=s))
+            speedup = t_fp32 / t_ozaki
+            row += f" {t_ozaki:>8.2f} / {speedup:>6.2f}x"
+        print(row)
     print()
 
 

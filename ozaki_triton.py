@@ -37,19 +37,16 @@ def compute_split_bits(n: int, acc_bits: int = 23, mantissa_bits: int = 10) -> i
     assert alpha >= 1, f"n={n} 太大，无法安全分片 (alpha={alpha})"
     return alpha
 
+
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 8},  num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 16}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 32}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 64}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_M': 16}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 32}, num_stages=4, num_warps=8),
-        triton.Config({'BLOCK_M': 64}, num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_M': 4},  num_stages=2, num_warps=2),
+        triton.Config({'BLOCK_M': 8},  num_stages=2, num_warps=2),
+        triton.Config({'BLOCK_M': 8},  num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_M': 16}, num_stages=2, num_warps=4),
     ],
     key=['M', 'K', 'NUM_SPLITS'],
 )
-
 @triton.jit
 def split_matrix_kernel(
     A_ptr, slices_ptr, scales_ptr,
@@ -109,7 +106,8 @@ def split_matrix(
         alpha: 每个分片的尾数位数
 
     Returns:
-        slices: [(scale_a, A_i_fp16), ...]，长度为 num_splits
+        slices: (num_splits, M, K) FP16 分片张量
+        scales: (num_splits, M) FP32 缩放系数张量
     """
     assert A.dtype == torch.float32
     assert A.dim() == 2
@@ -118,38 +116,60 @@ def split_matrix(
     BLOCK_K = triton.next_power_of_2(K)
     assert BLOCK_K <= 8192, f"K={K} too large to fit in SRAM"
 
-    slices_tensor = torch.empty((num_splits, M, K), dtype=torch.float16, device=A.device)
-    scales_tensor = torch.empty((num_splits, M), dtype=torch.float32, device=A.device)
+    slices = torch.empty((num_splits, M, K), dtype=torch.float16, device=A.device)
+    scales = torch.empty((num_splits, M), dtype=torch.float32, device=A.device)
 
     grid = lambda META: (triton.cdiv(M, META['BLOCK_M']),)
     split_matrix_kernel[grid](
-        A, slices_tensor, scales_tensor,
+        A, slices, scales,
         M, K,
         A.stride(-2), A.stride(-1),
-        slices_tensor.stride(0), slices_tensor.stride(1), slices_tensor.stride(2),
-        scales_tensor.stride(0), scales_tensor.stride(1),
+        slices.stride(0), slices.stride(1), slices.stride(2),
+        scales.stride(0), scales.stride(1),
         BLOCK_K=BLOCK_K,
         NUM_SPLITS=num_splits,
         ALPHA=alpha,
     )
 
-    return slices_tensor, scales_tensor
+    return slices, scales
 
 
 # ============================================================
 # 2. Triton 矩阵乘法 kernel
 # ============================================================
 
+def prune_configs(configs, named_args, **kwargs):
+    SMEM_LIMIT = 166912
+    BYTES_PER_ELEM = 2
+    pruned = []
+    for cfg in configs:
+        bm = cfg.kwargs['BLOCK_M']
+        bn = cfg.kwargs['BLOCK_N']
+        bk = cfg.kwargs['BLOCK_K']
+        ns = cfg.num_stages
+        smem = ns * (bm * bk + bk * bn) * BYTES_PER_ELEM
+        if smem <= SMEM_LIMIT:
+            pruned.append(cfg)
+    return pruned
+
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_stages=2, num_warps=4),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        # 小 tile, 适合 num_splits>=3 或小矩阵
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=3, num_warps=4),
+
+        # 中 tile, num_splits=2 时的主力
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=8),
+
+        # 大 tile, 只有 num_splits=2 + 大矩阵能跑得动, 寄存器可能 spill, 留着让 autotune 自己判断
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=8),
     ],
     key=['M', 'N', 'K', 'NUM_SPLITS'],
+    prune_configs_by={'early_config_prune': prune_configs},
 )
 @triton.jit
 def matmul_kernel(
