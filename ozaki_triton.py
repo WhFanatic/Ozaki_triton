@@ -133,7 +133,7 @@ def split_matrix(
         ALPHA=alpha,
     )
 
-    return list(zip(scales_tensor, slices_tensor))
+    return slices_tensor, scales_tensor
 
 
 # ============================================================
@@ -142,30 +142,34 @@ def split_matrix(
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 256, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
     ],
-    key=['M', 'N', 'K'],
-    reset_to_zero=['C_ptr'], # 关键! 否则 autotune 会污染首次调用传入的 C
+    key=['M', 'N', 'K', 'NUM_SPLITS'],
 )
 @triton.jit
 def matmul_kernel(
-    A_ptr, B_ptr, C_ptr,
-    scale_a_ptr,
-    scale_b_ptr,
+    A_slices_ptr, B_slices_ptr, C_ptr,
+    A_scales_ptr, B_scales_ptr,
     M, N, K,
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
+    stride_al, stride_am, stride_ak,
+    stride_bl, stride_bk, stride_bn,
     stride_cm, stride_cn,
+    stride_sal, stride_sam,
+    stride_sbl, stride_sbn,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
 ):
-    """FP16 输入、FP32 累加的分块矩阵乘法。"""
+    """
+    Ozaki 融合 GEMM: 单次 K 循环内完成所有 splits x splits 个分片对的乘法并累加.
+    A/B 读取次数从 splits^2 降到 2*splits, C 只写一次.
+    """
     pid_m = tl.program_id(0) # 当前线程块负责的矩阵行块索引
     pid_n = tl.program_id(1) # 当前线程块负责的矩阵列块索引
 
@@ -174,34 +178,48 @@ def matmul_kernel(
     mask_m = offs_m < M
     mask_n = offs_n < N
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32) # FP32 累加器, 累加分块矩阵乘积
+    out = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
+    # 预先加载所有分片的缩放系数 scales
+    sa_all = [tl.zeros((BLOCK_M,), dtype=tl.float32)] * NUM_SPLITS
+    sb_all = [tl.zeros((BLOCK_N,), dtype=tl.float32)] * NUM_SPLITS
+
+    for l in tl.static_range(NUM_SPLITS):
+        sa_all[l] = tl.load(A_scales_ptr + l * stride_sal + offs_m * stride_sam, mask=mask_m, other=0.0) # (num_splits, BLOCK_M)
+        sb_all[l] = tl.load(B_scales_ptr + l * stride_sbl + offs_n * stride_sbn, mask=mask_n, other=0.0) # (num_splits, BLOCK_N)
+
+    # 沿 k 方向分块累加
     for k_start in range(0, K, BLOCK_K):
         offs_k = k_start + tl.arange(0, BLOCK_K)
         mask_k = offs_k < K
-
-        # 加载 A 的 tile [BLOCK_M, BLOCK_K]
-        a_ptrs = A_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
         mask_a = mask_m[:, None] & mask_k[None, :]
-        a = tl.load(a_ptrs, mask=mask_a, other=0.0).to(tl.float16)
-
-        # 加载 B 的 tile [BLOCK_K, BLOCK_N]
-        b_ptrs = B_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
         mask_b = mask_k[:, None] & mask_n[None, :]
-        b = tl.load(b_ptrs, mask=mask_b, other=0.0).to(tl.float16)
+        offs_a = offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        offs_b = offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
 
-        # FP16 乘、FP32 累加 (关键: 必须 FP32 累加, 否则会溢出)
-        acc += tl.dot(a, b).to(tl.float32)
+        a_tiles = [tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float16)] * NUM_SPLITS
+        for i in tl.static_range(NUM_SPLITS):
+            a_ptrs = A_slices_ptr + i * stride_al + offs_a
+            a_tiles[i] = tl.load(a_ptrs, mask=mask_a, other=0.0).to(tl.float16) # (num_splits, BLOCK_M, BLOCK_K)
 
-    # Epilogue: 应用 row/col scale
-    sa = tl.load(scale_a_ptr + offs_m, mask=mask_m, other=0.0)
-    sb = tl.load(scale_b_ptr + offs_n, mask=mask_n, other=0.0)
-    acc = acc * sa[:, None] * sb[None, :]
+        b_tiles = [tl.zeros((BLOCK_K, BLOCK_N), dtype=tl.float16)] * NUM_SPLITS
+        for j in tl.static_range(NUM_SPLITS):
+            b_ptrs = B_slices_ptr + j * stride_bl + offs_b
+            b_tiles[j] = tl.load(b_ptrs, mask=mask_b, other=0.0).to(tl.float16) # (num_splits, BLOCK_K, BLOCK_N)
 
-    c_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+        # num_splits^2 次交叉乘积
+        for i in tl.static_range(NUM_SPLITS):
+            a = a_tiles[i]
+            sa = sa_all[i]
+            for j in tl.static_range(NUM_SPLITS):
+                b = b_tiles[j]
+                sb = sb_all[j]
+                out += tl.dot(a, b).to(tl.float32) * sa[:, None] * sb[None, :]
+
+    offs_c = offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     mask_c = mask_m[:, None] & mask_n[None, :]
 
-    tl.atomic_add(c_ptrs, acc, mask=mask_c)
+    tl.store(C_ptr + offs_c, out, mask=mask_c)
 
 
 # ============================================================
@@ -216,16 +234,15 @@ def ozaki_matmul(
 ) -> torch.Tensor:
     """
     Ozaki Scheme 矩阵乘法：C = A @ B
-    
-    流程：
-    1. Split: 将 A 分为 sA 个分片，B 分为 sB 个分片
-    2. Compute: 计算所有 sA × sB 个 FP16 交叉乘积
-    3. Sum: 用 FP32 累加所有乘积（乘以对应的缩放因子）
+
+    流程:
+    1. Split: 将 A 分为 num_splits 个分片，B 分为 num_splits 个分片
+    2. Compute & Sum: 所有 num_splits^2 个交叉乘积的计算和累加
 
     Args:
         A: (M, K) FP32 矩阵
         B: (K, N) FP32 矩阵
-        num_splits: 分片数量，越多精度越高但计算量越大
+        num_splits: 分片数量
         verbose: 是否打印调试信息
 
     Returns:
@@ -241,23 +258,23 @@ def ozaki_matmul(
         print(f"[Ozaki] M={M}, K={K}, N={N}, splits={num_splits}, alpha={alpha}")
 
     # Step 1: Split
-    A_slices = split_matrix(A, num_splits, alpha)  # [(scale_a, A_i_fp16), ...]
-    B_slices = split_matrix(B.T, num_splits, alpha)  # 对 B 按列分片 = 对 B^T 按行分片
+    A_slices, A_scales = split_matrix(A, num_splits, alpha)  # A_slices: (num_splits, M, K), A_scales: (num_splits, M)
+    B_slices, B_scales = split_matrix(B.T, num_splits, alpha)  # 对 B 按列分片 = 对 B^T 按行分片
+    B_slices = B_slices.transpose(-1, -2)
 
-    # Step 2 & 3: Compute all cross-products and accumulate
-    C = torch.zeros((M, N), dtype=torch.float32, device=A.device)
+    # Step 2: Compute all cross-products and accumulate
+    C = torch.empty((M, N), dtype=torch.float32, device=A.device)
     grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
-
-    for scale_a, A_i in A_slices:
-        for scale_b, B_j in B_slices:
-            B_jT = B_j.T
-            matmul_kernel[grid](
-                A_i, B_jT, C,
-                scale_a, scale_b,
-                M, N, K,
-                A_i.stride(0), A_i.stride(1),
-                B_jT.stride(0), B_jT.stride(1),
-                C.stride(0), C.stride(1),
-            )
+    matmul_kernel[grid](
+        A_slices, B_slices, C,
+        A_scales, B_scales,
+        M, N, K,
+        A_slices.stride(0), A_slices.stride(1), A_slices.stride(2),
+        B_slices.stride(0), B_slices.stride(1), B_slices.stride(2),
+        C.stride(0), C.stride(1),
+        A_scales.stride(0), A_scales.stride(1),
+        B_scales.stride(0), B_scales.stride(1),
+        NUM_SPLITS=num_splits,
+    )
 
     return C
