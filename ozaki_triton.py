@@ -150,10 +150,13 @@ def split_matrix(
         triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
     ],
     key=['M', 'N', 'K'],
+    reset_to_zero=['C_ptr'], # 关键! 否则 autotune 会污染首次调用传入的 C
 )
 @triton.jit
 def matmul_kernel(
     A_ptr, B_ptr, C_ptr,
+    scale_a_ptr,
+    scale_b_ptr,
     M, N, K,
     stride_am, stride_ak,
     stride_bk, stride_bn,
@@ -168,49 +171,37 @@ def matmul_kernel(
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M) # 当前线程块负责的矩阵行索引列表
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N) # 当前线程块负责的矩阵列索引列表
+    mask_m = offs_m < M
+    mask_n = offs_n < N
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32) # FP32 累加器, 累加分块矩阵乘积
 
     for k_start in range(0, K, BLOCK_K):
         offs_k = k_start + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
 
         # 加载 A 的 tile [BLOCK_M, BLOCK_K]
         a_ptrs = A_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-        mask_a = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+        mask_a = mask_m[:, None] & mask_k[None, :]
         a = tl.load(a_ptrs, mask=mask_a, other=0.0).to(tl.float16)
 
         # 加载 B 的 tile [BLOCK_K, BLOCK_N]
         b_ptrs = B_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
-        mask_b = (offs_k[:, None] < K) & (offs_n[None, :] < N)
+        mask_b = mask_k[:, None] & mask_n[None, :]
         b = tl.load(b_ptrs, mask=mask_b, other=0.0).to(tl.float16)
 
         # FP16 乘、FP32 累加 (关键: 必须 FP32 累加, 否则会溢出)
         acc += tl.dot(a, b).to(tl.float32)
 
-    # 写回
+    # Epilogue: 应用 row/col scale
+    sa = tl.load(scale_a_ptr + offs_m, mask=mask_m, other=0.0)
+    sb = tl.load(scale_b_ptr + offs_n, mask=mask_n, other=0.0)
+    acc = acc * sa[:, None] * sb[None, :]
+
     c_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, acc, mask=mask_c)
+    mask_c = mask_m[:, None] & mask_n[None, :]
 
-
-def triton_matmul_fp16(A_fp16: torch.Tensor, B_fp16: torch.Tensor) -> torch.Tensor:
-    """调用 Triton kernel 执行 FP16 matmul，返回 FP32 结果。"""
-    assert A_fp16.dtype == torch.float16 and B_fp16.dtype == torch.float16
-    M, K = A_fp16.shape
-    K2, N = B_fp16.shape
-    assert K == K2
-
-    C = torch.empty((M, N), dtype=torch.float32, device=A_fp16.device)
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
-
-    matmul_kernel[grid](
-        A_fp16, B_fp16, C,
-        M, N, K,
-        A_fp16.stride(0), A_fp16.stride(1),
-        B_fp16.stride(0), B_fp16.stride(1),
-        C.stride(0), C.stride(1),
-    )
-    return C
+    tl.atomic_add(c_ptrs, acc, mask=mask_c)
 
 
 # ============================================================
@@ -255,14 +246,18 @@ def ozaki_matmul(
 
     # Step 2 & 3: Compute all cross-products and accumulate
     C = torch.zeros((M, N), dtype=torch.float32, device=A.device)
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
 
-    for i, (scale_a, A_i) in enumerate(A_slices):
-        for j, (scale_b, B_j) in enumerate(B_slices):
-            # A_i: (M, K) fp16, B_j: (N, K) fp16 (因为是 B^T 的分片)
-
-            C_ij = triton_matmul_fp16(A_i, B_j.T)
-            C_ij = C_ij * scale_a[:, None] * scale_b[None, :]
-
-            C += C_ij
+    for scale_a, A_i in A_slices:
+        for scale_b, B_j in B_slices:
+            B_jT = B_j.T
+            matmul_kernel[grid](
+                A_i, B_jT, C,
+                scale_a, scale_b,
+                M, N, K,
+                A_i.stride(0), A_i.stride(1),
+                B_jT.stride(0), B_jT.stride(1),
+                C.stride(0), C.stride(1),
+            )
 
     return C
