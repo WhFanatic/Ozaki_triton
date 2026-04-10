@@ -37,49 +37,103 @@ def compute_split_bits(n: int, acc_bits: int = 23, mantissa_bits: int = 10) -> i
     assert alpha >= 1, f"n={n} 太大，无法安全分片 (alpha={alpha})"
     return alpha
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 8},  num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 16}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 32}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 64}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 16}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 32}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_M': 64}, num_stages=2, num_warps=8),
+    ],
+    key=['M', 'K', 'NUM_SPLITS'],
+)
 
-def split_matrix(A: torch.Tensor, num_splits: int, alpha: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
+@triton.jit
+def split_matrix_kernel(
+    A_ptr, slices_ptr, scales_ptr,
+    M, K,
+    stride_am, stride_ak,             # A 的 stride
+    stride_sl, stride_sm, stride_sk,  # slices 的 stride (num_splits, M, K)
+    stride_cl, stride_cm,             # scales 的 stride (num_splits, M)
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,            # 必须 >= K，且是 2 的幂
+    NUM_SPLITS: tl.constexpr,
+    ALPHA: tl.constexpr,
+):
     """
-    将 FP32 矩阵 A 分解为 num_splits 个 FP16 分片。
-    
-    每个分片 = (scale, A_slice_fp16)，其中：
-    - scale: 每行的缩放因子 (FP32)，用于对齐指数
-    - A_slice_fp16: 截断后的低精度分片 (FP16)
-    
-    算法：
-    1. 对每行，找到最大绝对值确定指数上界
-    2. 用 2^(exponent - alpha) 作为截断阈值
-    3. 通过 round-to-nearest 提取高位到当前分片
-    4. 从残差中继续提取下一个分片
+    融合版 split_matrix kernel: 将 FP32 矩阵分解为 NUM_SPLITS 个 FP16 分片.
+    约束: BLOCK_K >= K, 整行一次性装入寄存器才能支持跨 split 迭代时 residual 始终驻留 SRAM.
     """
-    residual = A.clone().float()
-    slices = []
+    pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, BLOCK_K)
+    mask_m = offs_m < M
+    mask_k = offs_k < K
+    mask = mask_m[:, None] & mask_k[None, :]
 
-    # 预计算常量
-    extract_const = float(2 ** alpha)  # 2^alpha，用于计算 scale
-    fp16_max = 65504.0
+    # 一次性加载整行 A 到寄存器
+    a_offs = offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    residual = tl.load(A_ptr + a_offs, mask=mask, other=0.0).to(tl.float32)
 
-    for s in range(num_splits):
-        # 每行的最大绝对值，用于确定指数上界
-        row_max = residual.abs().amax(dim=-1, keepdim=True).clamp(min=1e-38)
+    for l in tl.static_range(NUM_SPLITS):
+        # row_max 行最大绝对值, 加小量保护后续 log2 运算
+        row_max = tl.maximum(tl.max(tl.abs(residual), axis=-1), 1e-38)
 
-        # sigma = 2^exponent 是 row_max 的上界幂次
-        # scale = sigma / 2^alpha = 2^(exponent - alpha)，截断阈值
-        _, exponent = torch.frexp(row_max)
-        sigma = torch.ldexp(torch.ones_like(exponent), exponent.to(torch.int32))
-        scale = sigma / extract_const
+        # scale = 2^(ceil(log2(row_max)) - ALPHA)
+        scale = tl.exp2(tl.ceil(tl.log2(row_max)) - ALPHA)
+        scale_offs = l * stride_cl + offs_m * stride_cm
+        tl.store(scales_ptr + scale_offs, scale, mask=mask_m)
 
-        # 提取高位：缩放后截断到 alpha 位
-        scaled = residual / scale
-        slice_fp32 = scaled.clamp(-fp16_max, fp16_max)
-        slice_fp16 = slice_fp32.to(torch.float16)
+        # 提取分片并写回
+        slice = (residual / scale[:, None]).to(tl.float16)
+        slice_offs = l * stride_sl + offs_m[:, None] * stride_sm + offs_k[None, :] * stride_sk # 注意用 slices 自己的 stride
+        tl.store(slices_ptr + slice_offs, slice, mask=mask)
 
-        slices.append((scale.squeeze(-1), slice_fp16))
+        # SRAM 内更新 residual
+        residual = residual - slice.to(tl.float32) * scale[:, None] # 要用 fp16 的 slice 转回 fp32 再计算残差, 才能保持精度
 
-        # 更新残差
-        residual = residual - slice_fp16.float() * scale
 
-    return slices
+def split_matrix(
+    A: torch.Tensor,
+    num_splits: int,
+    alpha: int,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """
+    使用 Triton kernel 实现 split_matrix.
+
+    Args:
+        A: (M, K) FP32 矩阵
+        num_splits: 分片数量
+        alpha: 每个分片的尾数位数
+
+    Returns:
+        slices: [(scale_a, A_i_fp16), ...]，长度为 num_splits
+    """
+    assert A.dtype == torch.float32
+    assert A.dim() == 2
+    M, K = A.shape
+
+    BLOCK_K = triton.next_power_of_2(K)
+    assert BLOCK_K <= 8192, f"K={K} too large to fit in SRAM"
+
+    slices_tensor = torch.empty((num_splits, M, K), dtype=torch.float16, device=A.device)
+    scales_tensor = torch.empty((num_splits, M), dtype=torch.float32, device=A.device)
+
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']),)
+    split_matrix_kernel[grid](
+        A, slices_tensor, scales_tensor,
+        M, K,
+        A.stride(-2), A.stride(-1),
+        slices_tensor.stride(0), slices_tensor.stride(1), slices_tensor.stride(2),
+        scales_tensor.stride(0), scales_tensor.stride(1),
+        BLOCK_K=BLOCK_K,
+        NUM_SPLITS=num_splits,
+        ALPHA=alpha,
+    )
+
+    return list(zip(scales_tensor, slices_tensor))
 
 
 # ============================================================
@@ -130,7 +184,7 @@ def matmul_kernel(
         mask_b = (offs_k[:, None] < K) & (offs_n[None, :] < N)
         b = tl.load(b_ptrs, mask=mask_b, other=0.0).to(tl.float16)
 
-        # FP16 乘、FP32 累加
+        # FP16 乘、FP32 累加 (关键: 必须 FP32 累加, 否则会溢出)
         acc += tl.dot(a, b).to(tl.float32)
 
     # 写回
