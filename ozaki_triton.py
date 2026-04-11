@@ -86,6 +86,17 @@ def split_matrix(A: torch.Tensor, num_splits: int, alpha: int) -> list[tuple[tor
 # 2. Triton 矩阵乘法 kernel
 # ============================================================
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 256, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+    ],
+    key=['M', 'N', 'K'],
+)
 @triton.jit
 def matmul_kernel(
     A_ptr, B_ptr, C_ptr,
@@ -136,9 +147,7 @@ def triton_matmul_fp16(A_fp16: torch.Tensor, B_fp16: torch.Tensor) -> torch.Tens
     assert K == K2
 
     C = torch.empty((M, N), dtype=torch.float32, device=A_fp16.device)
-
-    BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
 
     matmul_kernel[grid](
         A_fp16, B_fp16, C,
@@ -146,7 +155,6 @@ def triton_matmul_fp16(A_fp16: torch.Tensor, B_fp16: torch.Tensor) -> torch.Tens
         A_fp16.stride(0), A_fp16.stride(1),
         B_fp16.stride(0), B_fp16.stride(1),
         C.stride(0), C.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
     )
     return C
 
@@ -159,6 +167,7 @@ def ozaki_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
     num_splits: int = 3,
+    verbose: bool = False,
 ) -> torch.Tensor:
     """
     Ozaki Scheme 矩阵乘法：C = A @ B
@@ -167,12 +176,13 @@ def ozaki_matmul(
     1. Split: 将 A 分为 sA 个分片，B 分为 sB 个分片
     2. Compute: 计算所有 sA × sB 个 FP16 交叉乘积
     3. Sum: 用 FP32 累加所有乘积（乘以对应的缩放因子）
-    
+
     Args:
         A: (M, K) FP32 矩阵
         B: (K, N) FP32 矩阵
         num_splits: 分片数量，越多精度越高但计算量越大
-    
+        verbose: 是否打印调试信息
+
     Returns:
         C: (M, N) FP32 结果
     """
@@ -182,7 +192,8 @@ def ozaki_matmul(
     assert K == K2
 
     alpha = compute_split_bits(K)
-    print(f"[Ozaki] M={M}, K={K}, N={N}, splits={num_splits}, alpha={alpha}")
+    if verbose:
+        print(f"[Ozaki] M={M}, K={K}, N={N}, splits={num_splits}, alpha={alpha}")
 
     # Step 1: Split
     A_slices = split_matrix(A, num_splits, alpha)  # [(scale_a, A_i_fp16), ...]
@@ -194,10 +205,8 @@ def ozaki_matmul(
     for i, (scale_a, A_i) in enumerate(A_slices):
         for j, (scale_b, B_j) in enumerate(B_slices):
             # A_i: (M, K) fp16, B_j: (N, K) fp16 (因为是 B^T 的分片)
-            # 计算 A_i @ B_j^T
-            C_ij = triton_matmul_fp16(A_i, B_j.T.contiguous())
 
-            # 还原缩放：C_ij 的第 (m, n) 个元素需乘以 scale_a[m] * scale_b[n]
+            C_ij = triton_matmul_fp16(A_i, B_j.T)
             C_ij = C_ij * scale_a[:, None] * scale_b[None, :]
 
             C += C_ij
