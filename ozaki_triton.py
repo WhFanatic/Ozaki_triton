@@ -51,9 +51,9 @@ def compute_split_bits(n: int, acc_bits: int = 23, mantissa_bits: int = 10) -> i
 def split_matrix_kernel(
     A_ptr, slices_ptr, scales_ptr,
     M, K,
-    stride_am, stride_ak,             # A 的 stride
-    stride_sl, stride_sm, stride_sk,  # slices 的 stride (num_splits, M, K)
-    stride_cl, stride_cm,             # scales 的 stride (num_splits, M)
+    stride_ab, stride_am, stride_ak,             # A 的 stride (batch, M, K)
+    stride_sb, stride_sl, stride_sm, stride_sk,  # slices 的 stride (batch, num_splits, M, K)
+    stride_cb, stride_cl, stride_cm,             # scales 的 stride (batch, num_splits, M)
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,            # 必须 >= K，且是 2 的幂
     NUM_SPLITS: tl.constexpr,
@@ -61,9 +61,17 @@ def split_matrix_kernel(
 ):
     """
     融合版 split_matrix kernel: 将 FP32 矩阵分解为 NUM_SPLITS 个 FP16 分片.
+    支持 batch 维: grid = (batch, cdiv(M, BLOCK_M))
     约束: BLOCK_K >= K, 整行一次性装入寄存器才能支持跨 split 迭代时 residual 始终驻留 SRAM.
     """
-    pid_m = tl.program_id(0)
+    pid_b = tl.program_id(0) # batch 索引
+    pid_m = tl.program_id(1) # 行块索引
+
+    # 按 batch 偏移指针
+    A_ptr      = A_ptr      + pid_b * stride_ab
+    slices_ptr = slices_ptr + pid_b * stride_sb
+    scales_ptr = scales_ptr + pid_b * stride_cb
+
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_k = tl.arange(0, BLOCK_K)
     mask_m = offs_m < M
@@ -85,7 +93,7 @@ def split_matrix_kernel(
 
         # 提取分片并写回
         slice = (residual / scale[:, None]).to(tl.float16)
-        slice_offs = l * stride_sl + offs_m[:, None] * stride_sm + offs_k[None, :] * stride_sk # 注意用 slices 自己的 stride
+        slice_offs = l * stride_sl + offs_m[:, None] * stride_sm + offs_k[None, :] * stride_sk # 注意用 slices 自己的 stride 计算 offs 而不是复用 a_offs
         tl.store(slices_ptr + slice_offs, slice, mask=mask)
 
         # SRAM 内更新 residual
@@ -96,36 +104,36 @@ def split_matrix(
     A: torch.Tensor,
     num_splits: int,
     alpha: int,
-) -> list[tuple[torch.Tensor, torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     使用 Triton kernel 实现 split_matrix.
 
     Args:
-        A: (M, K) FP32 矩阵
+        A: (B, M, K) FP32 矩阵 (B 可以为 1)
         num_splits: 分片数量
         alpha: 每个分片的尾数位数
 
     Returns:
-        slices: (num_splits, M, K) FP16 分片张量
-        scales: (num_splits, M) FP32 缩放系数张量
+        slices: (B, num_splits, M, K) FP16 分片张量
+        scales: (B, num_splits, M) FP32 缩放系数张量
     """
     assert A.dtype == torch.float32
-    assert A.dim() == 2
-    M, K = A.shape
+    assert A.dim() == 3
+    B, M, K = A.shape
 
     BLOCK_K = triton.next_power_of_2(K)
     assert BLOCK_K <= 8192, f"K={K} too large to fit in SRAM"
 
-    slices = torch.empty((num_splits, M, K), dtype=torch.float16, device=A.device)
-    scales = torch.empty((num_splits, M), dtype=torch.float32, device=A.device)
+    slices = torch.empty((B, num_splits, M, K), dtype=torch.float16, device=A.device)
+    scales = torch.empty((B, num_splits, M),    dtype=torch.float32, device=A.device)
 
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']),)
+    grid = lambda META: (B, triton.cdiv(M, META['BLOCK_M']))
     split_matrix_kernel[grid](
         A, slices, scales,
         M, K,
-        A.stride(-2), A.stride(-1),
-        slices.stride(0), slices.stride(1), slices.stride(2),
-        scales.stride(0), scales.stride(1),
+        A.stride(0), A.stride(1), A.stride(2),
+        slices.stride(0), slices.stride(1), slices.stride(2), slices.stride(3),
+        scales.stride(0), scales.stride(1), scales.stride(2),
         BLOCK_K=BLOCK_K,
         NUM_SPLITS=num_splits,
         ALPHA=alpha,
@@ -176,11 +184,11 @@ def matmul_kernel(
     A_slices_ptr, B_slices_ptr, C_ptr,
     A_scales_ptr, B_scales_ptr,
     M, N, K,
-    stride_al, stride_am, stride_ak,
-    stride_bl, stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    stride_sal, stride_sam,
-    stride_sbl, stride_sbn,
+    stride_ab, stride_al, stride_am, stride_ak,    # A_slices: (B, L, M, K)
+    stride_bb, stride_bl, stride_bk, stride_bn,    # B_slices: (B, L, K, N)
+    stride_cb, stride_cm, stride_cn,               # C: (B, M, N)
+    stride_sab, stride_sal, stride_sam,            # A_scales: (B, L, M)
+    stride_sbb, stride_sbl, stride_sbn,            # B_scales: (B, L, N)
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -189,12 +197,21 @@ def matmul_kernel(
     """
     Ozaki 融合 GEMM: 单次 K 循环内完成所有 splits x splits 个分片对的乘法并累加.
     A/B 读取次数从 splits^2 降到 2*splits, C 只写一次.
+    支持 batch 维: grid = (batch, cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
     """
-    pid_m = tl.program_id(0) # 当前线程块负责的矩阵行块索引
-    pid_n = tl.program_id(1) # 当前线程块负责的矩阵列块索引
+    pid_b = tl.program_id(0) # batch 索引
+    pid_m = tl.program_id(1) # 行块索引
+    pid_n = tl.program_id(2) # 列块索引
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M) # 当前线程块负责的矩阵行索引列表
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N) # 当前线程块负责的矩阵列索引列表
+    # 按 batch 偏移指针
+    A_slices_ptr = A_slices_ptr + pid_b * stride_ab
+    B_slices_ptr = B_slices_ptr + pid_b * stride_bb
+    C_ptr        = C_ptr        + pid_b * stride_cb
+    A_scales_ptr = A_scales_ptr + pid_b * stride_sab
+    B_scales_ptr = B_scales_ptr + pid_b * stride_sbb
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M) # 行块范围
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N) # 列块范围
     mask_m = offs_m < M
     mask_n = offs_n < N
 
@@ -246,6 +263,39 @@ def matmul_kernel(
 # 3. Ozaki Scheme 主流程
 # ============================================================
 
+def _canonicalize_batch(
+    A: torch.Tensor,
+    B: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]:
+    """
+    把 A: (..., M, K) 和 B: (..., K, N) 的 batch 维 broadcast 到一致, 拍平成 3D.
+
+    Returns:
+        A3: (BN, M, K) FP32, contiguous
+        B3: (BN, K, N) FP32, contiguous
+        batch_shape: 原始 broadcast 后的 batch shape (用于最后 view 回去)
+    """
+    assert A.dim() >= 2 and B.dim() >= 2
+    M, K  = A.shape[-2:]
+    K2, N = B.shape[-2:]
+    assert K == K2, f"contraction dim mismatch: A K={K}, B K={K2}"
+
+    A_batch = A.shape[:-2]
+    B_batch = B.shape[:-2]
+    batch_shape = torch.broadcast_shapes(A_batch, B_batch)
+
+    # expand 是零拷贝(只设置 stride=0); reshape 在 expand 后必要时会触发 contiguous 复制
+    A_exp = A.expand(*batch_shape, M, K)
+    B_exp = B.expand(*batch_shape, K, N)
+
+    BN = math.prod(batch_shape)
+
+    A3 = A_exp.reshape(BN, M, K).contiguous()
+    B3 = B_exp.reshape(BN, K, N).contiguous()
+
+    return A3, B3, batch_shape
+
+
 def ozaki_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -253,48 +303,68 @@ def ozaki_matmul(
     verbose: bool = False,
 ) -> torch.Tensor:
     """
-    Ozaki Scheme 矩阵乘法：C = A @ B
+    Ozaki Scheme 矩阵乘法: C = A @ B
 
     流程:
-    1. Split: 将 A 分为 num_splits 个分片，B 分为 num_splits 个分片
+    1. Split: 将 A, B 分为 num_splits 个分片
     2. Compute & Sum: 所有 num_splits^2 个交叉乘积的计算和累加
 
+    支持 broadcastable 的前置 batch 维, 语义同 torch.matmul:
+        A: (..., M, K), B: (..., K, N) -> C: (broadcast(...), M, N)
+
     Args:
-        A: (M, K) FP32 矩阵
-        B: (K, N) FP32 矩阵
+        A: (..., M, K) FP32
+        B: (..., K, N) FP32
         num_splits: 分片数量
         verbose: 是否打印调试信息
 
     Returns:
-        C: (M, N) FP32 结果
+        C: (broadcast(...), M, N) FP32
     """
     assert A.dtype == torch.float32 and B.dtype == torch.float32
-    M, K = A.shape
-    K2, N = B.shape
-    assert K == K2
+
+    M, K = A.shape[-2:]
+    N    = B.shape[-1]
+
+    # 1. broadcast batch 维, 拍平成 3D
+    A3, B3, batch_shape = _canonicalize_batch(A, B)
+    BN = A3.shape[0]
+    out_shape = (*batch_shape, M, N)
+
+    if BN == 0:
+        return torch.empty(out_shape, dtype=torch.float32, device=A.device)
 
     alpha = compute_split_bits(K)
     if verbose:
-        print(f"[Ozaki] M={M}, K={K}, N={N}, splits={num_splits}, alpha={alpha}")
+        print(f"[Ozaki] batch={batch_shape}, M={M}, K={K}, N={N}, "
+              f"splits={num_splits}, alpha={alpha}")
 
-    # Step 1: Split
-    A_slices, A_scales = split_matrix(A, num_splits, alpha)  # A_slices: (num_splits, M, K), A_scales: (num_splits, M)
-    B_slices, B_scales = split_matrix(B.T, num_splits, alpha)  # 对 B 按列分片 = 对 B^T 按行分片
-    B_slices = B_slices.transpose(-1, -2)
+    # 2. Split. B 用 transpose 视角免物化转置:
+    #    把 B (BN, K, N) 看成 "对每个 batch 的 B^T (BN, N, K) 按行 split",
+    #    得到 B_slices_T: (BN, num_splits, N, K), 再 transpose 回 (BN, num_splits, K, N).
+    A_slices, A_scales = split_matrix(A3, num_splits, alpha)  # A_slices: (BN, num_splits, M, K), A_scales: (BN, num_splits, M)
 
-    # Step 2: Compute all cross-products and accumulate
-    C = torch.empty((M, N), dtype=torch.float32, device=A.device)
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
+    B_T = B3.transpose(-1, -2)  # (BN, N, K), 零拷贝 view
+    B_slices_T, B_scales = split_matrix(B_T.contiguous(), num_splits, alpha)  # B_slices_T: (BN, num_splits, N, K), B_scales: (BN, num_splits, N)
+    B_slices = B_slices_T.transpose(-1, -2)  # (BN, num_splits, K, N), 零拷贝 view
+
+    # 3. Compute all cross-products and accumulate
+    C = torch.empty((BN, M, N), dtype=torch.float32, device=A.device)
+    grid = lambda META: (
+        BN,
+        triton.cdiv(M, META['BLOCK_M']),
+        triton.cdiv(N, META['BLOCK_N']),
+    )
     matmul_kernel[grid](
         A_slices, B_slices, C,
         A_scales, B_scales,
         M, N, K,
-        A_slices.stride(0), A_slices.stride(1), A_slices.stride(2),
-        B_slices.stride(0), B_slices.stride(1), B_slices.stride(2),
-        C.stride(0), C.stride(1),
-        A_scales.stride(0), A_scales.stride(1),
-        B_scales.stride(0), B_scales.stride(1),
+        A_slices.stride(0), A_slices.stride(1), A_slices.stride(2), A_slices.stride(3),
+        B_slices.stride(0), B_slices.stride(1), B_slices.stride(2), B_slices.stride(3),
+        C.stride(0), C.stride(1), C.stride(2),
+        A_scales.stride(0), A_scales.stride(1), A_scales.stride(2),
+        B_scales.stride(0), B_scales.stride(1), B_scales.stride(2),
         NUM_SPLITS=num_splits,
     )
 
-    return C
+    return C.view(out_shape)

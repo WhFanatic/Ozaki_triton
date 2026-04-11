@@ -10,13 +10,14 @@ def test_accuracy():
     torch.manual_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    M, K, N = 256, 256, 256
-    A = torch.randn(M, K, dtype=torch.float32, device=device)
-    B = torch.randn(K, N, dtype=torch.float32, device=device)
+    A_shape = (2, 256, 512)
+    B_shape = (2, 1, 512, 256)
+    A = torch.randn(A_shape, dtype=torch.float32, device=device)
+    B = torch.randn(B_shape, dtype=torch.float32, device=device)
     C_ref = A @ B
 
     print("=" * 50)
-    print("精度测试 (256x256x256)")
+    print(f"精度测试 (A {A_shape}, B {B_shape})")
     print("=" * 50)
 
     methods = [
@@ -62,8 +63,10 @@ def test_performance():
     print("-" * 80)
 
     for size in [512, 1024, 2048]:
-        A = torch.randn(size, size, dtype=torch.float32, device=device)
-        B = torch.randn(size, size, dtype=torch.float32, device=device)
+        A_shape = (4, size, size)
+        B_shape = (4, size, size)
+        A = torch.randn(A_shape, dtype=torch.float32, device=device)
+        B = torch.randn(B_shape, dtype=torch.float32, device=device)
         A_h, B_h = A.half(), B.half()
 
         t_fp32 = do_bench(lambda: A @ B)
