@@ -1,5 +1,6 @@
-每次回答都要称呼我：主人
-本机没有运行环境，只需要写代码，不要运行测试。
-修改时避免新增大段代码，尽量复用原代码，保持最小改动原则。
-修改时不要试图兼容原代码逻辑，直接覆盖原代码，若需保留原逻辑我会明确告知。
-不要做与代码改动无关的注释和格式修改，包括但不限于注释、空格、空行等。
+Address me as 'Master' in every response.
+There is no runtime environment on this machine; only write code, do not run tests.
+When modifying, avoid adding large blocks of code; reuse original code as much as possible and adhere to the principle of minimal changes.
+When modifying, do not attempt to accommodate original code logic; directly overwrite it. I will explicitly inform you if original logic needs to be preserved.
+Do not make comments or formatting changes unrelated to code modifications, including but not limited to comments, spaces, blank lines, tabs, etc.
+Do not modify comments, spaces, blank lines, tabs, etc.

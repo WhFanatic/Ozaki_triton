@@ -1,316 +1,298 @@
 """Ozaki Scheme 测试脚本"""
-
+import random
+import numpy as np
 import torch
 import csv
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from triton.testing import do_bench
+
 from ozaki_triton import ozaki_matmul
 
 
-def test_accuracy(output_csv="test_accuracy.csv"):
-    """精度测试 - 覆盖 5 种精度组合场景"""
-    torch.manual_seed(42)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    A_shape = (2, 256, 512)
-    B_shape = (2, 1, 512, 256)
-
-    scenarios = [
-        ("FP32 -> FP16", torch.float32, torch.float16),
-        ("FP32 -> INT8", torch.float32, torch.int8),
-        ("FP64 -> FP16", torch.float64, torch.float16),
-        ("FP64 -> INT8", torch.float64, torch.int8),
-        ("FP16 -> FP32", torch.float16, torch.float32),
-    ]
-
-    results = []
-    total = len(scenarios)
-
-    print(f"\nStarting accuracy test, {total} scenarios...")
-
-    for i, (name, input_dtype, slice_dtype) in enumerate(scenarios, 1):
-        print(f"[{i}/{total}] Running scenario: {name}")
-
-        A = torch.randn(A_shape, dtype=input_dtype, device=device)
-        B = torch.randn(B_shape, dtype=input_dtype, device=device)
-        C_ref = (A.double() @ B.double()).double()
-
-        if slice_dtype == torch.int8:
-            naive_name = "Naive FP16"
-            naive_fn = lambda: (A.half() @ B.half()).to(input_dtype)
-        else:
-            naive_name = f"Naive {slice_dtype}"
-            naive_fn = lambda: (A.to(slice_dtype) @ B.to(slice_dtype)).to(input_dtype)
-
-        methods = [(naive_name, naive_fn)]
-        for s in [2, 3, 4]:
-            methods.append((f"Ozaki(split{s})", lambda s=s: ozaki_matmul(A, B, num_splits=s, slice_dtype=slice_dtype)))
-
-        for name_method, fn in methods:
-            C = fn()
-            rel = (C - C_ref).norm() / C_ref.norm()
-            mx = (C - C_ref).abs().max()
-            results.append({
-                "scenario": name,
-                "input_dtype": str(input_dtype).split(".")[-1],
-                "slice_dtype": str(slice_dtype).split(".")[-1],
-                "method": name_method,
-                "max_error": mx.item(),
-                "rel_error": rel.item(),
-            })
-
-    with open(output_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["scenario", "input_dtype", "slice_dtype", "method", "max_error", "rel_error"])
-        writer.writeheader()
-        writer.writerows(results)
-
-    print(f"Accuracy test completed. Results saved to {output_csv}")
-    return results
-
-
-def test_performance(output_csv="test_performance.csv"):
-    """性能测试 - 覆盖 5 种精度组合场景"""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    if device == "cpu":
-        print("Performance test requires GPU, skipping")
+def test(num_shapes=4, output_csv="test_results.csv"):
+    """运行精度与性能的统一基准测试。
+    测试流程：
+        1. 生成随机形状 (B, M, N, K)，满足显存约束 (4*128^3 < numel < 32*2048^3)。
+        2. 遍历预定义的 4 种数据类型场景 (如 FP32->FP16, FP64->INT8 等)。
+        3. 对每种场景，计算参考结果 (Ref) 并对比 5 种方法：
+            - Naive FP16 (Baseline)
+            - Ozaki 分块 (Splits=1, 2, 3, 4)
+        4. 记录时间、加速比、最大误差 (Max Error) 和相对误差 (Rel Error)。
+    Args:
+        num_shapes (int): 随机生成的测试矩阵形状数量。默认为 4。
+        output_csv (str): 输出结果保存的 CSV 文件路径。默认为 "test_results.csv"。
+    Returns:
+        list: 包含所有测试结果字典的列表。如果无可用 GPU 则返回空列表。
+    """
+    if not torch.cuda.is_available():
+        print("Test requires GPU, skipping")
         return []
+    device = "cuda"
 
-    splits = [2, 3, 4]
     scenarios = [
         ("FP32 -> FP16", torch.float32, torch.float16),
         ("FP32 -> INT8", torch.float32, torch.int8),
         ("FP64 -> FP16", torch.float64, torch.float16),
         ("FP64 -> INT8", torch.float64, torch.int8),
-        ("FP16 -> FP32", torch.float16, torch.float32),
+        # ("FP16 -> FP32", torch.float16, torch.float32),
     ]
+    splits = [0, 1, 2, 3, 4]
+
+    # 随机选取 shapes: (B, M, N, K)
+    shapes = [(B, M, N, K) for B in 2**np.arange(7) \
+                           for M in 2**np.arange(7, 12) \
+                           for N in 2**np.arange(7, 12) \
+                           for K in 2**np.arange(8, 13) \
+              if 4 * 128**3 < B * M * N * K < 32 * 2048**3]
+    shapes = random.choices(shapes, k=num_shapes)
 
     results = []
-    total = len(scenarios) * 3  # 5 scenarios * 3 sizes
-
-    print(f"\nStarting performance test, {total} runs...")
-
+    total = len(shapes) * len(scenarios)
     count = 0
-    for name, input_dtype, slice_dtype in scenarios:
-        for size in [512, 1024, 2048]:
+
+    print(f"\nStarting test: {len(shapes)} shapes x {len(scenarios)} scenarios = {total} cases")
+
+    for shape in shapes:
+        B, M, N, K = shape
+        shape_str = f"({B},{M},{N},{K})"
+
+        for name, input_dtype, slice_dtype in scenarios:
             count += 1
-            print(f"[{count}/{total}] Running: {name}, size={size}x{size}")
+            print(f"[{count}/{total}] shape={shape_str}, scenario={name}")
 
-            A_shape = (4, size, size)
-            B_shape = (4, size, size)
+            # 构造输入 (统一 FP64)
+            row_scales = 10 ** ((torch.rand(M, device=device) * 2 - 1) * 2)  # [1e-2, 1e2]
+            col_scales = 10 ** ((torch.rand(N, device=device) * 2 - 1) * 2)  # [1e-2, 1e2]
+            a_fp64 = torch.randn((B, M, K), dtype=torch.float64, device=device) * row_scales[:, None]
+            b_fp64 = torch.randn((B, K, N), dtype=torch.float64, device=device) * col_scales
+            a = a_fp64.to(input_dtype)
+            b = b_fp64.to(input_dtype)
 
-            if input_dtype == torch.float64:
-                A = torch.randn(A_shape, dtype=torch.float64, device=device)
-                B = torch.randn(B_shape, dtype=torch.float64, device=device)
-            else:
-                A = torch.randn(A_shape, dtype=input_dtype, device=device)
-                B = torch.randn(B_shape, dtype=input_dtype, device=device)
-
-            t_ref = do_bench(lambda: A @ B)
-            results.append({
-                "scenario": name,
-                "input_dtype": str(input_dtype).split(".")[-1],
-                "slice_dtype": str(slice_dtype).split(".")[-1],
-                "size": size,
-                "ref_time": t_ref,
-            })
+            # Reference
+            C_ref = torch.nan_to_num(a @ b).double()
+            t_ref = do_bench(lambda: a @ b)
 
             for s in splits:
-                t_ozaki = do_bench(lambda s=s: ozaki_matmul(A, B, num_splits=s, slice_dtype=slice_dtype))
-                speedup = t_ref / t_ozaki
+                # Naive (默认都用 FP16)
+                if s == 0:
+                    C = torch.nan_to_num(a.half() @ b.half()).double()
+                    t = do_bench(lambda: (a.half() @ b.half()).to(input_dtype))
+                    max_err = (C - C_ref).abs().max().item()
+                    rel_err = ((C - C_ref).norm() / C_ref.norm()).item()
+
+                # Ozaki 各 splits
+                else:
+                    ozaki_fn = lambda s=s: ozaki_matmul(a, b, num_splits=s, slice_dtype=slice_dtype)
+                    C = ozaki_fn().double()
+                    t = do_bench(ozaki_fn)
+                    max_err = (C - C_ref).abs().max().item()
+                    rel_err = ((C - C_ref).norm() / C_ref.norm()).item()
+
                 results.append({
-                    "scenario": name,
+                    "scenario":    name,
                     "input_dtype": str(input_dtype).split(".")[-1],
                     "slice_dtype": str(slice_dtype).split(".")[-1],
-                    "size": size,
-                    "splits": s,
-                    "ozaki_time": t_ozaki,
-                    "speedup": speedup,
+                    "shape":       shape_str,
+                    "splits":      s,
+                    "ref_time":    t_ref,
+                    "ozaki_time":  t,
+                    "speedup":     t_ref / t,
+                    "max_error":   max_err,
+                    "rel_error":   rel_err,
                 })
 
-    with open(output_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["scenario", "input_dtype", "slice_dtype", "size", "splits", "ref_time", "ozaki_time", "speedup"])
-        writer.writeheader()
-        writer.writerows(results)
+        # 及时更新 CSV
+        fieldnames = ["scenario", "input_dtype", "slice_dtype", "shape", "splits",
+                    "ref_time", "ozaki_time", "speedup", "max_error", "rel_error"]
+        with open(output_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(results)
 
-    print(f"Performance test completed. Results saved to {output_csv}")
+    print(f"Test completed. Results saved to {output_csv}")
     return results
 
 
-def show_summary(accuracy_csv="test_accuracy.csv", performance_csv="test_performance.csv", output_txt="test_summary.txt"):
-    """从 CSV 读取数据并生成摘要报告"""
-    import csv
+def show_summary(results_csv="test_results.csv", output_txt="test_summary.txt"):
+    """从统一的 results CSV 生成摘要报告."""
+    print(f"\nGenerating summary from {results_csv}...")
 
-    print(f"\nGenerating summary from {accuracy_csv} and {performance_csv}...")
+    with open(results_csv, "r") as f:
+        reader = csv.DictReader(f)
+        data = list(reader)
 
     lines = []
+    lines.append("=" * 90)
+    lines.append("Ozaki Test Summary")
+    lines.append("=" * 90)
 
-    # ========== 精度测试摘要 ==========
-    lines.append("=" * 80)
-    lines.append("Accuracy Test Summary")
-    lines.append("=" * 80)
-
-    with open(accuracy_csv, "r") as f:
-        reader = csv.DictReader(f)
-        accuracy_data = list(reader)
-
-    scenarios = set(row["scenario"] for row in accuracy_data)
-    for scenario in scenarios:
-        scenario_rows = [r for r in accuracy_data if r["scenario"] == scenario]
-        lines.append(f"\nScenario: {scenario}")
-        lines.append("-" * 50)
-        lines.append(f"{'Method':<18} {'Max Error':>14} {'Rel Error':>14}")
-        lines.append("-" * 50)
-        for row in scenario_rows:
-            lines.append(f"{row['method']:<18} {float(row['max_error']):>14.6e} {float(row['rel_error']):>14.6e}")
-
-    lines.append("")
-
-    # ========== 性能测试摘要 ==========
-    lines.append("=" * 80)
-    lines.append("Performance Test Summary")
-    lines.append("=" * 80)
-
-    with open(performance_csv, "r") as f:
-        reader = csv.DictReader(f)
-        perf_data = list(reader)
-
-    scenarios = set(row["scenario"] for row in perf_data)
-    splits = [2, 3, 4]
+    # 按 scenario 分组，保持出现顺序
+    scenarios = []
+    seen = set()
+    for row in data:
+        if row["scenario"] not in seen:
+            scenarios.append(row["scenario"])
+            seen.add(row["scenario"])
 
     for scenario in scenarios:
-        scenario_rows = [r for r in perf_data if r["scenario"] == scenario]
+        scenario_rows = [r for r in data if r["scenario"] == scenario]
         lines.append(f"\nScenario: {scenario}")
-        lines.append("-" * 80)
+        lines.append("-" * 90)
+        header = (f"{'Method':<18} "
+                  f"{'Speedup(min~max)':>24} "
+                  f"{'MaxErr(min~max)':>28} "
+                  f"{'RelErr(min~max)':>28}")
+        lines.append(header)
+        lines.append("-" * 90)
 
-        header1 = f"{'Size':<8} {'Ref':>8}"
-        for s in splits:
-            header1 += f"  Ozaki(split{s})"
-        header2 = f"{'':<8} {'':>8}"
-        for s in splits:
-            header2 += f" {'time / speedup':>19}"
-        lines.append(header1)
-        lines.append(header2)
-        lines.append("-" * 80)
+        # 按 method 分组，保持出现顺序
+        methods_seen = []
+        methods_set = set()
+        for r in scenario_rows:
+            splits = int(r["splits"])
+            method = f"Ozaki(split{splits})" if splits > 0 else "Naive FP16"
+            if method not in methods_set:
+                methods_seen.append((method, splits))
+                methods_set.add(method)
 
-        for size in [512, 1024, 2048]:
-            ref_rows = [r for r in scenario_rows if r.get("size") == str(size) and not r.get("splits")]
-            if ref_rows:
-                t_ref = float(ref_rows[0]["ref_time"])
-                row = f"{size}x{size:<6} {t_ref:>8.2f}"
-                for s in splits:
-                    ozaki_rows = [r for r in scenario_rows if r.get("size") == str(size) and r.get("splits") == str(s)]
-                    if ozaki_rows:
-                        t_ozaki = float(ozaki_rows[0]["ozaki_time"])
-                        speedup = float(ozaki_rows[0]["speedup"])
-                        row += f" {t_ozaki:>8.2f} / {speedup:>6.2f}x"
-                lines.append(row)
+        for method, splits in methods_seen:
+            method_rows = [
+                r for r in scenario_rows
+                if int(r["splits"]) == splits
+            ]
+            speedups  = [float(r["speedup"])   for r in method_rows]
+            max_errs  = [float(r["max_error"])  for r in method_rows]
+            rel_errs  = [float(r["rel_error"])  for r in method_rows]
+
+            speedup_str  = f"{min(speedups):.3f} ~ {max(speedups):.3f}"
+            max_err_str  = f"{min(max_errs):.3e} ~ {max(max_errs):.3e}"
+            rel_err_str  = f"{min(rel_errs):.3e} ~ {max(rel_errs):.3e}"
+
+            lines.append(
+                f"{method:<18} "
+                f"{speedup_str:>24} "
+                f"{max_err_str:>28} "
+                f"{rel_err_str:>28}"
+            )
+
+        lines.append("")  # scenario 间空行
 
     summary = "\n".join(lines)
-
     with open(output_txt, "w") as f:
         f.write(summary)
 
     print(f"Summary saved to {output_txt}")
     print(summary)
-
     return summary
 
 
-def plot_summary(accuracy_csv="test_accuracy.csv", performance_csv="test_performance.csv", output_png="test_summary.png"):
-    """从 CSV 读取数据并绘制图表"""
-    import csv
+def plot_summary(results_csv="test_results.csv", output_png="test_summary.png"):
+    """从统一 CSV 绘制散点折线图."""
+    print(f"\nGenerating plots from {results_csv}...")
 
-    print(f"\nGenerating plots from {accuracy_csv} and {performance_csv}...")
-
-    # 读取 accuracy 数据
-    with open(accuracy_csv, "r") as f:
+    with open(results_csv, "r") as f:
         reader = csv.DictReader(f)
-        accuracy_data = list(reader)
+        data = list(reader)
 
-    # 读取 performance 数据
-    with open(performance_csv, "r") as f:
-        reader = csv.DictReader(f)
-        perf_data = list(reader)
+    # 保持顺序提取 scenarios 和 shapes
+    scenarios, seen = [], set()
+    for r in data:
+        if r["scenario"] not in seen:
+            scenarios.append(r["scenario"])
+            seen.add(r["scenario"])
 
-    scenarios = sorted(set(row["scenario"] for row in accuracy_data))
-    splits = [2, 3, 4]
-    sizes = [512, 1024, 2048]
+    shapes_per_scenario = {}
+    for s in scenarios:
+        shapes, seen_s = [], set()
+        for r in data:
+            if r["scenario"] == s and r["shape"] not in seen_s:
+                shapes.append(r["shape"])
+                seen_s.add(r["shape"])
+        shapes_per_scenario[s] = shapes
 
-    # 整理 accuracy 数据：每个 scenario 的 naive 精度和 Ozaki 精度
-    acc_naive = {}  # scenario -> rel_error
-    acc_ozaki = {s: {} for s in splits}  # split -> {scenario -> rel_error}
-    for row in accuracy_data:
-        scenario = row["scenario"]
-        method = row["method"]
-        rel_error = float(row["rel_error"])
-        if method.startswith("Naive"):
-            acc_naive[scenario] = rel_error
-        elif method.startswith("Ozaki"):
-            s = int(method.split("split")[1].rstrip(")"))
-            acc_ozaki[s][scenario] = rel_error
+    # methods 顺序: Naive, splits=1, splits=2, splits=3, splits=4
+    method_keys = ["0", "1", "2", "3", "4"]
+    method_labels = ["Naive FP16", "split=1", "split=2", "split=3", "split=4"]
+    method_markers = ["s", "o", "^", "v", "D"]
 
-    # 整理 performance 数据：计算 speedup
-    perf_speedup = {size: {s: {} for s in splits} for size in sizes}  # size -> split -> {scenario -> speedup}
-    for row in perf_data:
-        scenario = row["scenario"]
-        size = int(row["size"])
-        splits_val = row.get("splits")
-        if splits_val:
-            s = int(splits_val)
-            perf_speedup[size][s][scenario] = float(row["speedup"])
+    n = len(scenarios)
+    fig, axes = plt.subplots(1, n, constrained_layout=True, figsize=(5 * n, 5), squeeze=False)
+    axes = axes[0]
 
-    # 创建图形：4 个子图按行排列
-    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+    # 给每个 shape 分配固定颜色
+    all_shapes = sorted({sh for shs in shapes_per_scenario.values() for sh in shs})
+    cmap = plt.get_cmap("tab10")
+    shape_colors = {sh: cmap(i % 10) for i, sh in enumerate(all_shapes)}
 
-    # ===== 子图 1: Relative Error =====
-    ax = axes[0]
-    x = splits
-    # 先画 Naive 基准线（黑色虚线，只画 FP16）
-    fp16_naive = None
-    for scenario in scenarios:
-        if "FP16" in scenario and scenario in acc_naive:
-            fp16_naive = acc_naive[scenario]
-            break
-    if fp16_naive is not None:
-        ax.axhline(y=fp16_naive, color='black', linestyle='--', linewidth=2, label='Naive FP16')
-    # 再画 Ozaki 数据线
-    for i, scenario in enumerate(scenarios):
-        y = [acc_ozaki[s].get(scenario, None) for s in splits]
-        ax.plot(x, y, '.-', label=scenario, linewidth=2, markersize=8)
-
-    ax.set_xticks(splits)
-    ax.set_xlabel("Number of Splits")
-    ax.set_ylabel("Relative Error")
-    ax.set_title("Accuracy Comparison")
-    ax.set_yscale('log')
-    ax.legend(loc='upper right')
-    ax.grid(axis='y', alpha=0.3)
-
-    # ===== 子图 2-4: Performance (512/1024/2048) =====
-    for idx, size in enumerate(sizes, start=1):
+    for idx, scenario in enumerate(scenarios):
         ax = axes[idx]
-        # 先画 speedup=1 基准线（黑色虚线，加粗）
-        ax.axhline(y=1.0, color='black', linestyle='--', linewidth=2, label='Baseline (speedup=1)')
-        # 再画 Ozaki 数据线
-        for i, scenario in enumerate(scenarios):
-            y = [perf_speedup[size][s].get(scenario, None) for s in splits]
-            ax.plot(x, y, '.-', label=scenario, linewidth=2, markersize=8)
-        ax.set_xticks(splits)
-        ax.set_xlabel("Number of Splits")
-        ax.set_ylabel("Speedup")
-        ax.set_title(f"Performance ({size}x{size})")
-        ax.legend(loc='upper right')
-        ax.grid(axis='y', alpha=0.3)
 
-    plt.tight_layout()
+        for shape in shapes_per_scenario[scenario]:
+            xs, ys = [], []
+            for mk in method_keys:
+                row = next(
+                    (r for r in data
+                     if r["scenario"] == scenario
+                     and r["shape"] == shape
+                     and r["splits"] == mk),
+                    None,
+                )
+                if row is None:
+                    xs.append(None)
+                    ys.append(None)
+                else:
+                    xs.append(float(row["rel_error"]))
+                    ys.append(float(row["speedup"]))
+
+            color = shape_colors[shape]
+            # 折线 (用实数对的部分)
+            valid_xs = [x for x in xs if x is not None]
+            valid_ys = [y for y in ys if y is not None]
+            ax.plot(valid_xs, valid_ys, '-', color=color, linewidth=0.2,
+                    alpha=0.6, label=shape)
+            # 各 method 的 marker
+            for x, y, marker, mlabel in zip(xs, ys, method_markers, method_labels):
+                if x is None or y is None:
+                    continue
+                ax.scatter(x, y, marker=marker, color=color, s=20, linewidths=0, zorder=3)
+
+        # speedup = 1 baseline
+        ax.axhline(y=1.0, color='black', linestyle='-', linewidth=2.5,
+                   label='speedup = 1', zorder=2)
+
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel("Relative Error")
+        ax.set_ylabel("Speedup")
+        ax.set_title(scenario)
+        ax.grid(True, which="both", alpha=0.3)
+
+        marker_handles = [
+            Line2D([0], [0], marker=m, color='gray', markerfacecolor='gray',
+                    markeredgecolor='black', linestyle='', markersize=10, label=l)
+            for m, l in zip(method_markers, method_labels)
+        ]
+        shape_handles = [
+            Line2D([0], [0], color=shape_colors[sh], linewidth=2, label=sh)
+            for sh in shapes_per_scenario[scenario]
+        ]
+        baseline_handle = Line2D([0], [0], color='black', linewidth=2.5, label='speedup = 1')
+        if idx == 0:
+            ax.legend(handles=marker_handles, loc='best', fontsize=8)
+
     plt.savefig(output_png, dpi=150)
     plt.close()
-
     print(f"Plot saved to {output_png}")
 
 
 if __name__ == "__main__":
-    test_accuracy()
-    test_performance()
+    random.seed(42)
+    torch.manual_seed(42)
+    use_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = use_tf32
+    torch.backends.cudnn.allow_tf32 = use_tf32
+
+    test()
     show_summary()
     plot_summary()
