@@ -172,6 +172,31 @@ source run_test.sh
 
 Kernel 签名变化:`A_slices` 形状 `(num_splits, M, K)`,`B_slices` 形状 `(num_splits, K, N)`,scales 同步带 split 维,`NUM_SPLITS` 作为 constexpr。scale 提到 K 循环外预加载。
 
+#### 累加与 scale 解耦,scale 移到 K 循环外
+
+维护 `num_splits^2` 个独立累加器;K 循环内只做纯 `tl.dot(a, b, acc)`,K 循环结束后 epilogue 一次性应用 scale。
+
+收益:
+- Tensor core 流水连续: 原来 K 循环内每次 dot 后都有 `dot_out * sa * sb` 两次 FP32 elementwise 乘法,占用 CUDA core,拖慢 Tensor core 流水。现在 K 循环里**只有 mma**,Tensor core 连续发射不被打断。
+- mma 硬件累加: `tl.dot(a, b, acc)` 三参数形式是硬件 fused mma-accumulate,比 `acc += tl.dot(a, b)` 少一次中间数据搬运。
+- scale 计算次数减少: 总 elementwise 操作数从 `num_splits^2 × (K/BLOCK_K)` 降到 `num_splits^2`,对 K=1024、BLOCK_K=32 减少 32×。
+
+妥协:
+- 累加器手动展开为 16 个独立变量: 用 `acc00, acc01, ..., acc33` 16 个独立标量,通过编译期 `if i == ... and j == ...` 静态分支访问。Triton 对 list 的 IR 处理有 bug,2D list 索引 / 跨循环 list 重赋值会触发 segfault。展开成独立变量是绕过编译器 bug 的工程妥协,功能上等价但保证编译通过。`num_splits ≤ 4` 的限制由此引入。
+- 存储 `num_splits^2` 个累加器增大了寄存器压力。
+
+#### A tile 不预加载,B tile 预加载
+
+每次内层 i 循环现场 load `a_i`(用完即弃);b_tiles 在 K 循环开头预 load 全部 num_splits 份。
+
+收益:同时活跃的 A tile 从 `num_splits` 降到 1,寄存器压力减半。B 预加载是因为每个 b_j 在 j 循环里被 num_splits 个不同的 a 复用,预加载省掉重复 HBM 读取。这是访存量和寄存器压力的权衡。
+
+#### Swizzled grid ordering (group_m=8)
+
+grid 从 3D `(BN, Mb, Nb)` 改为 2D `(BN, Mb*Nb)`,kernel 内部按 group swizzle 重新解出 `pid_m, pid_n`。
+
+收益:标准行优先 grid 调度下,相邻 program 沿 N 方向扫,共享的 A tile 早早被 L2 evict。Group swizzle 让连续 program 集中在 8×N 的小区域,A 和 B tile 都能被 L2 反复命中。Ozaki kernel 因为 `num_splits^2` 倍的 slice 读取,L2 命中率影响被放大,这个优化收益比普通 GEMM 更大。
+
 ### 6.2 功能扩展
 
 #### 支持 broadcastable batch 维  `533e8f2`

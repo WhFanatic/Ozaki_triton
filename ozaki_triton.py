@@ -226,22 +226,29 @@ def split_matrix(
 def prune_configs(configs, named_args, **kwargs):
     """根据 SMEM 预算和外层累加器精度过滤配置."""
     SMEM_LIMIT = 166912
-    BYTES_PER_ELEM = 2  # 分片字节数, 取保守值
+    REG_LIMIT_BYTES = 256 * 1024  # A100 每 SM 的寄存器文件
+    BYTES_PER_ELEM = 2
+    num_splits = kwargs['NUM_SPLITS']
     pruned = []
     for cfg in configs:
         bm = cfg.kwargs['BLOCK_M']
         bn = cfg.kwargs['BLOCK_N']
         bk = cfg.kwargs['BLOCK_K']
-        ns = cfg.num_stages
-        smem = ns * (bm * bk + bk * bn) * BYTES_PER_ELEM
-        if smem <= SMEM_LIMIT:
+        # SMEM: num_stages 个 K-block buffer
+        smem = cfg.num_stages * (bm * bk + bk * bn) * BYTES_PER_ELEM
+        # 寄存器: num_splits^2 个 FP32 累加器 (近似)
+        reg  = num_splits * num_splits * bm * bn * 4
+        if smem <= SMEM_LIMIT and reg <= REG_LIMIT_BYTES:
             pruned.append(cfg)
     return pruned
 
 
 @triton.autotune(
     configs=[
-        # 小 tile, FP64 外层累加器和 num_splits 大时的主力
+        # FP64 外层累加器主力 (寄存器占用高，用更小 tile)
+        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 16,  'BLOCK_K': 32}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 32,  'BLOCK_K': 32}, num_stages=3, num_warps=4),
+        # 小 tile
         triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=3, num_warps=4),
         triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32,  'BLOCK_K': 32}, num_stages=3, num_warps=4),
         triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=3, num_warps=4),
@@ -251,7 +258,7 @@ def prune_configs(configs, named_args, **kwargs):
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=3, num_warps=4),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=8),
-        # 大 tile, 仅 FP32 外层 + num_splits 小时跑得动
+        # 大 tile
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32}, num_stages=3, num_warps=8),
         triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=8),
     ],
@@ -286,8 +293,17 @@ def matmul_kernel(
     输出: store 时转 OUT_DTYPE.
     """
     pid_b = tl.program_id(0) # batch 索引
-    pid_m = tl.program_id(1) # 行块索引
-    pid_n = tl.program_id(2) # 列块索引
+    pid   = tl.program_id(1) # swizzle 索引
+
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    GROUP_M: tl.constexpr = 8
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + (pid % group_size_m)  # 行块索引
+    pid_n = (pid % num_pid_in_group) // group_size_m  # 列块索引
 
     # 按 batch 偏移指针
     A_slices_ptr = A_slices_ptr + pid_b * stride_ab
@@ -301,16 +317,30 @@ def matmul_kernel(
     mask_m = offs_m < M
     mask_n = offs_n < N
 
-    # 外层累加器, FP64 输入时为 FP64, 其余 FP32
-    out = tl.zeros((BLOCK_M, BLOCK_N), dtype=OUT_ACCUM_DTYPE)
-
-    # scales 始终是 FP32, 在 K 循环外预先加载
-    sa_all = [tl.zeros((BLOCK_M,), dtype=tl.float32)] * NUM_SPLITS
-    sb_all = [tl.zeros((BLOCK_N,), dtype=tl.float32)] * NUM_SPLITS
-
-    for l in tl.static_range(NUM_SPLITS):
-        sa_all[l] = tl.load(A_scales_ptr + l * stride_sal + offs_m * stride_sam, mask=mask_m, other=0.0) # (num_splits, BLOCK_M)
-        sb_all[l] = tl.load(B_scales_ptr + l * stride_sbl + offs_n * stride_sbn, mask=mask_n, other=0.0) # (num_splits, BLOCK_N)
+    # 内层累加器, FP32 or INT32 硬件累加. 预先开辟 num_splits^2 个以分离 matmul 和 scale, 保证 dot 流水通畅以及硬件累加
+    # triton 限制不能构造二维 tensor 列表, 且即使一维列表在 acc = dot(a, b, acc) 这种调用方式下也有问题, 所以手动展开
+    # 由于 NUM_SPLITS 为编译期常量, 所以判断分支为 False 的会自动消除
+    ACC_DTYPE: tl.constexpr = tl.int32 if IS_INT_SLICE else tl.float32
+    if NUM_SPLITS > 0:
+        acc00 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+    if NUM_SPLITS > 1:
+        acc01 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+        acc10 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+        acc11 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+    if NUM_SPLITS > 2:
+        acc02 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+        acc12 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+        acc20 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+        acc21 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+        acc22 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+    if NUM_SPLITS > 3:
+        acc03 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+        acc13 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+        acc23 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+        acc30 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+        acc31 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+        acc32 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
+        acc33 = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_DTYPE)
 
     # 沿 k 方向分块累加
     for k_start in range(0, K, BLOCK_K):
@@ -321,11 +351,7 @@ def matmul_kernel(
         offs_a = offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
         offs_b = offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
 
-        a_tiles = [tl.zeros((BLOCK_M, BLOCK_K), dtype=SLICE_DTYPE)] * NUM_SPLITS
-        for i in tl.static_range(NUM_SPLITS):
-            a_ptrs = A_slices_ptr + i * stride_al + offs_a
-            a_tiles[i] = tl.load(a_ptrs, mask=mask_a, other=0).to(SLICE_DTYPE)
-
+        # 预先加载所有 B_slices 避免重复加载
         b_tiles = [tl.zeros((BLOCK_K, BLOCK_N), dtype=SLICE_DTYPE)] * NUM_SPLITS
         for j in tl.static_range(NUM_SPLITS):
             b_ptrs = B_slices_ptr + j * stride_bl + offs_b
@@ -333,18 +359,56 @@ def matmul_kernel(
 
         # num_splits^2 次交叉乘积
         for i in tl.static_range(NUM_SPLITS):
-            a = a_tiles[i]
-            sa = sa_all[i]
+            a_ptrs = A_slices_ptr + i * stride_al + offs_a
+            a = tl.load(a_ptrs, mask=mask_a, other=0).to(SLICE_DTYPE)
             for j in tl.static_range(NUM_SPLITS):
                 b = b_tiles[j]
-                sb = sb_all[j]
-                # 硬件累加 (FP32 或 INT32) -> 转 FP32 -> 乘 FP32 scale -> 转外层 dtype 累加
-                if IS_INT_SLICE:
-                    dot_out = tl.dot(a, b, out_dtype=tl.int32).to(tl.float32)
-                else:
-                    dot_out = tl.dot(a, b, out_dtype=tl.float32)
-                scaled = dot_out * sa[:, None] * sb[None, :]
-                out += scaled.to(OUT_ACCUM_DTYPE)
+                # i, j 为编译期常量, 所有循环和分支判断会在编译期展开
+                if i == 0 and j == 0: acc00 = tl.dot(a, b, acc00, out_dtype=ACC_DTYPE)
+                if i == 0 and j == 1: acc01 = tl.dot(a, b, acc01, out_dtype=ACC_DTYPE)
+                if i == 0 and j == 2: acc02 = tl.dot(a, b, acc02, out_dtype=ACC_DTYPE)
+                if i == 0 and j == 3: acc03 = tl.dot(a, b, acc03, out_dtype=ACC_DTYPE)
+                if i == 1 and j == 0: acc10 = tl.dot(a, b, acc10, out_dtype=ACC_DTYPE)
+                if i == 1 and j == 1: acc11 = tl.dot(a, b, acc11, out_dtype=ACC_DTYPE)
+                if i == 1 and j == 2: acc12 = tl.dot(a, b, acc12, out_dtype=ACC_DTYPE)
+                if i == 1 and j == 3: acc13 = tl.dot(a, b, acc13, out_dtype=ACC_DTYPE)
+                if i == 2 and j == 0: acc20 = tl.dot(a, b, acc20, out_dtype=ACC_DTYPE)
+                if i == 2 and j == 1: acc21 = tl.dot(a, b, acc21, out_dtype=ACC_DTYPE)
+                if i == 2 and j == 2: acc22 = tl.dot(a, b, acc22, out_dtype=ACC_DTYPE)
+                if i == 2 and j == 3: acc23 = tl.dot(a, b, acc23, out_dtype=ACC_DTYPE)
+                if i == 3 and j == 0: acc30 = tl.dot(a, b, acc30, out_dtype=ACC_DTYPE)
+                if i == 3 and j == 1: acc31 = tl.dot(a, b, acc31, out_dtype=ACC_DTYPE)
+                if i == 3 and j == 2: acc32 = tl.dot(a, b, acc32, out_dtype=ACC_DTYPE)
+                if i == 3 and j == 3: acc33 = tl.dot(a, b, acc33, out_dtype=ACC_DTYPE)
+
+    # 预先加载所有 B_scales 避免重复加载
+    sb_all = [tl.zeros((BLOCK_N,), dtype=tl.float32)] * NUM_SPLITS # scales 始终是 FP32
+    for l in tl.static_range(NUM_SPLITS):
+        sb_all[l] = tl.load(B_scales_ptr + l * stride_sbl + offs_n * stride_sbn, mask=mask_n, other=0.0) # (num_splits, BLOCK_N)
+
+    # 外层累加器, FP64 or FP32, 不低于输入与分片精度
+    out = tl.zeros((BLOCK_M, BLOCK_N), dtype=OUT_ACCUM_DTYPE)
+    for i in tl.static_range(NUM_SPLITS):
+        sa = tl.load(A_scales_ptr + i * stride_sal + offs_m * stride_sam, mask=mask_m, other=0.0) # (num_splits, BLOCK_M)
+        for j in tl.static_range(NUM_SPLITS):
+            sb = sb_all[j]
+            if i == 0 and j == 0: scaled = acc00.to(tl.float32) * sa[:, None] * sb[None, :]
+            if i == 0 and j == 1: scaled = acc01.to(tl.float32) * sa[:, None] * sb[None, :]
+            if i == 0 and j == 2: scaled = acc02.to(tl.float32) * sa[:, None] * sb[None, :]
+            if i == 0 and j == 3: scaled = acc03.to(tl.float32) * sa[:, None] * sb[None, :]
+            if i == 1 and j == 0: scaled = acc10.to(tl.float32) * sa[:, None] * sb[None, :]
+            if i == 1 and j == 1: scaled = acc11.to(tl.float32) * sa[:, None] * sb[None, :]
+            if i == 1 and j == 2: scaled = acc12.to(tl.float32) * sa[:, None] * sb[None, :]
+            if i == 1 and j == 3: scaled = acc13.to(tl.float32) * sa[:, None] * sb[None, :]
+            if i == 2 and j == 0: scaled = acc20.to(tl.float32) * sa[:, None] * sb[None, :]
+            if i == 2 and j == 1: scaled = acc21.to(tl.float32) * sa[:, None] * sb[None, :]
+            if i == 2 and j == 2: scaled = acc22.to(tl.float32) * sa[:, None] * sb[None, :]
+            if i == 2 and j == 3: scaled = acc23.to(tl.float32) * sa[:, None] * sb[None, :]
+            if i == 3 and j == 0: scaled = acc30.to(tl.float32) * sa[:, None] * sb[None, :]
+            if i == 3 and j == 1: scaled = acc31.to(tl.float32) * sa[:, None] * sb[None, :]
+            if i == 3 and j == 2: scaled = acc32.to(tl.float32) * sa[:, None] * sb[None, :]
+            if i == 3 and j == 3: scaled = acc33.to(tl.float32) * sa[:, None] * sb[None, :]
+            out += scaled.to(OUT_ACCUM_DTYPE)
 
     offs_c = offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     mask_c = mask_m[:, None] & mask_n[None, :]
@@ -415,6 +479,7 @@ def ozaki_matmul(
     assert A.dtype == B.dtype, f"A/B dtype mismatch: {A.dtype} vs {B.dtype}"
     assert A.dtype in _INPUT_DTYPES, f"unsupported input dtype: {A.dtype}"
     assert slice_dtype in _SLICE_DTYPE_INFO, f"unsupported slice dtype: {slice_dtype}"
+    assert num_splits <= 4, f"num_splits must be <= 4, got {num_splits}"
 
     input_dtype = A.dtype
     dot_accum_dtype = _select_dot_accum_dtype(slice_dtype)
@@ -449,8 +514,7 @@ def ozaki_matmul(
     C = torch.empty((BN, M, N), dtype=input_dtype, device=A.device)
     grid = lambda META: (
         BN,
-        triton.cdiv(M, META['BLOCK_M']),
-        triton.cdiv(N, META['BLOCK_N']),
+        triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),
     )
     matmul_kernel[grid](
         A_slices, B_slices, C,
