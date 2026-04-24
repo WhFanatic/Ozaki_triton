@@ -111,13 +111,14 @@ def compute_split_bits(
 )
 @triton.jit
 def split_matrix_kernel(
-    A_ptr, slices_ptr, scales_ptr,
+    A_ptr, slices_ptr, scales_ptr, residu_ptr ,
     M, K,
     stride_ab, stride_am, stride_ak,             # A 的 stride (batch, M, K)
     stride_sb, stride_sl, stride_sm, stride_sk,  # slices 的 stride (batch, num_splits, M, K)
     stride_cb, stride_cl, stride_cm,             # scales 的 stride (batch, num_splits, M)
+    stride_rb, stride_rm, stride_rk,             # residual 的 stride (batch, M, K)
     BLOCK_M: tl.constexpr,
-    BLOCK_K: tl.constexpr,            # 必须 >= K，且是 2 的幂
+    BLOCK_K: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     ALPHA: tl.constexpr,
     SLICE_DTYPE: tl.constexpr,
@@ -128,7 +129,6 @@ def split_matrix_kernel(
 ):
     """
     通用 split kernel: 将矩阵分解为 NUM_SPLITS 个分片.
-    约束: BLOCK_K >= K, 整行一次性装入寄存器才能支持跨 split 迭代时 residual 始终驻留 SRAM.
     """
     pid_b = tl.program_id(0) # batch 索引
     pid_m = tl.program_id(1) # 行块索引
@@ -137,48 +137,57 @@ def split_matrix_kernel(
     A_ptr      = A_ptr      + pid_b * stride_ab
     slices_ptr = slices_ptr + pid_b * stride_sb
     scales_ptr = scales_ptr + pid_b * stride_cb
+    residu_ptr = residu_ptr + pid_b * stride_rb
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_k = tl.arange(0, BLOCK_K)
     mask_m = offs_m < M
-    mask_k = offs_k < K
-    mask = mask_m[:, None] & mask_k[None, :]
-
-    # 一次性加载整行 A 到寄存器
-    a_offs = offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    residual = tl.load(A_ptr + a_offs, mask=mask, other=0.0).to(RESIDUAL_DTYPE) # residual 在 RESIDUAL_DTYPE 下迭代, 分片写出时转 SLICE_DTYPE
 
     for l in tl.static_range(NUM_SPLITS):
-        # row_max 行最大绝对值, 加小量保护后续 log2 运算
-        row_max = tl.maximum(tl.max(tl.abs(residual), axis=-1), 1e-38)
+        for sweep in tl.static_range(2):
+            if sweep == 0:
+                row_max = tl.full([BLOCK_M], value=1e-38, dtype=tl.float32)
+            else:
+                scale = tl.exp2(tl.ceil(tl.log2(row_max)) - ALPHA)
+                scale_offs = l * stride_cl + offs_m * stride_cm
+                tl.store(scales_ptr + scale_offs, scale, mask=mask_m)
 
-        # scale = 2^(ceil(log2(row_max)) - ALPHA)
-        scale = tl.exp2(tl.ceil(tl.log2(row_max)) - ALPHA)
-        scale_offs = l * stride_cl + offs_m * stride_cm
-        tl.store(scales_ptr + scale_offs, scale, mask=mask_m)
+            for k_start in range(0, K, BLOCK_K):
+                offs_k = k_start + tl.arange(0, BLOCK_K)
+                mask_k = offs_k < K
+                mask = mask_m[:, None] & mask_k[None, :]
 
-        # 提取分片并写回
-        scaled = residual / scale[:, None]
-        if IS_INT_SLICE:
-            # round-half-away-from-zero + clamp
-            scaled_round = tl.where(scaled >= 0, scaled + 0.5, scaled - 0.5)
-            slice = tl.clamp(scaled_round, -INT_CLAMP - 1, INT_CLAMP).to(SLICE_DTYPE)
-        else:
-            slice = scaled.to(SLICE_DTYPE)
+                r_ptrs = residu_ptr  + offs_m[:, None] * stride_rm + offs_k[None, :] * stride_rk
+                if l == 0:
+                    a_ptrs = A_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+                    tile = tl.load(a_ptrs, mask=mask, other=0.0).to(RESIDUAL_DTYPE) # 第一个 split 从 A 读
+                else:
+                    tile = tl.load(r_ptrs, mask=mask, other=0.0).to(RESIDUAL_DTYPE) # 后续 split 从 residual buffer 读
 
-        slice_offs = l * stride_sl + offs_m[:, None] * stride_sm + offs_k[None, :] * stride_sk # 注意用 slices 自己的 stride 计算 offs 而不是复用 a_offs
-        tl.store(slices_ptr + slice_offs, slice, mask=mask)
+                if sweep == 0:
+                # Pass 1: 扫描所有 K-tile 求 row_max (行最大绝对值), 加小量保护后续 log2 运算
+                    row_max = tl.maximum(row_max, tl.max(tl.abs(tile), axis=-1).to(tl.float32))
+                else:
+                # Pass 2: 提取分片, 写 slice, 更新 residual
+                    # 提取分片
+                    scaled = tile / scale[:, None]
+                    if IS_INT_SLICE:
+                        # round-half-away-from-zero + clamp
+                        scaled_round = tl.where(scaled >= 0, scaled + 0.5, scaled - 0.5)
+                        slice = tl.clamp(scaled_round, -INT_CLAMP - 1, INT_CLAMP).to(SLICE_DTYPE)
+                    else:
+                        slice = scaled.to(SLICE_DTYPE)
 
-        # SRAM 内更新 residual
-        residual = residual - slice.to(RESIDUAL_DTYPE) * scale[:, None]
+                    # 写 slice
+                    slice_offs = l * stride_sl + offs_m[:, None] * stride_sm + offs_k[None, :] * stride_sk
+                    tl.store(slices_ptr + slice_offs, slice, mask=mask)
+
+                    # 更新 residual 并写回 buffer (最后一个 split 不需要写)
+                    if l < NUM_SPLITS - 1:
+                        tile -= slice.to(RESIDUAL_DTYPE) * scale[:, None]
+                        tl.store(r_ptrs, tile, mask=mask)
 
 
-def split_matrix(
-    A: torch.Tensor,
-    num_splits: int,
-    alpha: int,
-    slice_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
+def split_matrix(A, num_splits, alpha, slice_dtype):
     """
     Args:
         A: (B, M, K), 任意支持的浮点 dtype
@@ -191,22 +200,26 @@ def split_matrix(
     assert A.dim() == 3
     B, M, K = A.shape
 
-    BLOCK_K = triton.next_power_of_2(K)
-    assert BLOCK_K <= 8192, f"K={K} too large to fit in SRAM"
-
     residual_dtype = _select_out_accum_dtype(A.dtype)
 
     slices = torch.empty((B, num_splits, M, K), dtype=slice_dtype, device=A.device)
     scales = torch.empty((B, num_splits, M), dtype=torch.float32, device=A.device)
 
+    if num_splits > 1:
+        residu = torch.empty((B, M, K), dtype=torch.float32, device=A.device) # 只在 num_splits > 1 时需要 residual buffer
+    else:
+        residu = A  # 占位, 不会被读
+
     grid = lambda META: (B, triton.cdiv(M, META['BLOCK_M']))
     split_matrix_kernel[grid](
-        A, slices, scales,
+        A, slices, scales, residu,
         M, K,
         A.stride(0), A.stride(1), A.stride(2),
         slices.stride(0), slices.stride(1), slices.stride(2), slices.stride(3),
         scales.stride(0), scales.stride(1), scales.stride(2),
-        BLOCK_K=BLOCK_K,
+        residu.stride(0) if num_splits > 1 else 0,
+        residu.stride(1) if num_splits > 1 else 0,
+        residu.stride(2) if num_splits > 1 else 0,
         NUM_SPLITS=num_splits,
         ALPHA=alpha,
         SLICE_DTYPE=_TORCH_TO_TL[slice_dtype],
