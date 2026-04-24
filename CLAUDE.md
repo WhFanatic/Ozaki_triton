@@ -1,4 +1,4 @@
-Address me as 'Master' in every response.
+Address me as '主人' in every response.
 There is no runtime environment on this machine; only write code, do not run tests.
 When modifying, avoid adding large blocks of code; reuse original code as much as possible and adhere to the principle of minimal changes.
 When modifying, do not attempt to accommodate original code logic; directly overwrite it. I will explicitly inform you if original logic needs to be preserved.
