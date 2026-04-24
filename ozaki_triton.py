@@ -242,12 +242,12 @@ def split_matrix(A, num_splits, alpha, slice_dtype):
 # 2. Triton 矩阵乘法 kernel
 # ============================================================
 
-def prune_configs(configs, named_args, **kwargs):
+def prune_gemm(configs, named_args, **kwargs):
     """根据 SMEM 预算和外层累加器精度过滤配置."""
-    SMEM_LIMIT = 166912
-    REG_LIMIT_BYTES = 256 * 1024  # A100 每 SM 的寄存器文件
-    BYTES_PER_ELEM = 2
-    num_splits = kwargs['NUM_SPLITS']
+    SMEM_LIMIT = 192 * 1024
+    REG_LIMIT_BYTES = 256 * 1024  # A100 寄存器 256KB/SM
+    BYTES_PER_ELEM = 1 if kwargs['SLICE_DTYPE'] == torch.int8 else 2
+    num_splits = int(kwargs['NUM_SPLITS'])
     pruned = []
     for cfg in configs:
         bm = cfg.kwargs['BLOCK_M']
@@ -255,34 +255,38 @@ def prune_configs(configs, named_args, **kwargs):
         bk = cfg.kwargs['BLOCK_K']
         # SMEM: num_stages 个 K-block buffer
         smem = cfg.num_stages * (bm * bk + bk * bn) * BYTES_PER_ELEM
-        # 寄存器: num_splits^2 个 FP32 累加器 (近似)
+        # 寄存器: num_splits^2 个 INT32/FP32 累加器
         reg  = num_splits * num_splits * bm * bn * 4
         if smem <= SMEM_LIMIT and reg <= REG_LIMIT_BYTES:
             pruned.append(cfg)
-    return pruned
+    return pruned if pruned else configs
 
 
 @triton.autotune(
     configs=[
-        # FP64 外层累加器主力 (寄存器占用高，用更小 tile)
-        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 16,  'BLOCK_K': 32}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 32,  'BLOCK_K': 32}, num_stages=3, num_warps=4),
-        # 小 tile
-        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32,  'BLOCK_K': 32}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=3, num_warps=4),
-        # 中 tile
-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=3, num_warps=4),
+        # splits=1,2: 大 tile + BLOCK_K=64
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=8),
-        # 大 tile
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 32}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=3, num_warps=4),
+
+        # splits=1,2,3 通用: 中 tile
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=4, num_warps=4),
+
+        # splits=3,4: 小 tile + BLOCK_K=64
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32,  'BLOCK_K': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32,  'BLOCK_K': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32,  'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 32,  'BLOCK_K': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 32,  'BLOCK_K': 64}, num_stages=4, num_warps=4),
     ],
     key=['M', 'N', 'K', 'NUM_SPLITS', 'IS_INT_SLICE', 'IS_FP64_OUT'],
-    prune_configs_by={'early_config_prune': prune_configs},
+    prune_configs_by={'early_config_prune': prune_gemm},
 )
 @triton.jit
 def matmul_kernel(
