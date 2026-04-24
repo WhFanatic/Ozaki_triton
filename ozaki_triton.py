@@ -25,6 +25,8 @@ import triton
 import triton.language as tl
 import math
 
+from mytuner import optuna_autotune
+
 
 # ============================================================
 # 0. dtype 元信息
@@ -100,14 +102,18 @@ def compute_split_bits(
 # 1. 矩阵分片 (Splitting)
 # ============================================================
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 4},  num_stages=2, num_warps=2),
-        triton.Config({'BLOCK_M': 8},  num_stages=2, num_warps=2),
-        triton.Config({'BLOCK_M': 8},  num_stages=2, num_warps=4),
-        triton.Config({'BLOCK_M': 16}, num_stages=2, num_warps=4),
-    ],
+# @triton.autotune(
+#     configs=_expand_configs({
+@optuna_autotune(
+    param_space={
+        'BLOCK_M':    [2**i for i in range(2)],
+        'BLOCK_K':    [2**i for i in range(8, 12)],
+        'num_warps':  [2**i for i in range(5)],
+        'num_stages': [i for i in range(1, 7)],
+    },
+    # ),
     key=['M', 'K', 'NUM_SPLITS', 'IS_INT_SLICE', 'IS_FP64_RESIDUAL'],
+    n_trials=40,
 )
 @triton.jit
 def split_matrix_kernel(
