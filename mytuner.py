@@ -9,7 +9,7 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 def _expand_configs(param_space):
     """从 param_space 展开全量 configs 列表。"""
-    cfg_keys = {'num_warps', 'num_stages', 'num_ctas'}
+    cfg_keys = {'num_warps', 'num_stages', 'num_ctas', 'maxnreg'}
     return [Config({k: v for k, v in zip(param_space, v) if k not in cfg_keys},
                  **{k: v for k, v in zip(param_space, v) if k in cfg_keys})
             for v in itertools.product(*param_space.values())]
@@ -20,7 +20,11 @@ class OptunaAutotuner(Autotuner):
     def __init__(self, fn, arg_names, param_space, key, n_trials=100, sampler=None, **kwargs):
         self.param_space = param_space
         self.n_trials = n_trials
-        self.sampler = sampler if sampler else optuna.samplers.TPESampler()
+        self.sampler = sampler if sampler else optuna.samplers.TPESampler(
+            multivariate=True,
+            # constraints_func=lambda t: [-1. if tuple((k, t.params[k]) for k in keys) in pruned_keys else 1.],
+            # constraint 此处不适用, 因为 inf 惩罚本身就会降低驱使 sampler 向可行区探索
+        )
 
         configs = _expand_configs(param_space)
         super().__init__(fn, arg_names, configs, key, **kwargs)
@@ -28,25 +32,26 @@ class OptunaAutotuner(Autotuner):
         assert hasattr(self, '_bench'), "Autotuner._bench not found, check triton version"
 
     def _optuna_bench(self, pruned_configs, *args, **kwargs):
-            keys = sorted(self.param_space)
-            to_key = lambda c: tuple((k, c.all_kwargs()[k]) for k in keys)
-            all_map = {to_key(c): c for c in self.configs}
-            pruned_keys = {to_key(c) for c in pruned_configs}
-            timings = {}
+        keys = sorted(self.param_space)
+        to_key = lambda c: tuple((k, c.all_kwargs()[k]) for k in keys)
+        all_map = {to_key(c): c for c in self.configs}
+        pruned_keys = {to_key(c) for c in pruned_configs}
+        timings = {}
 
-            def objective(trial):
-                ck = tuple((k, trial.suggest_categorical(k, v)) for k, v in sorted(self.param_space.items()))
-                if ck not in pruned_keys:
-                    return float('inf')
-                t = self._bench(*args, config=all_map[ck], **kwargs)
-                timings[all_map[ck]] = t
-                return t[0]
+        def objective(trial):
+            ck = tuple((k, trial.suggest_categorical(k, v)) for k, v in sorted(self.param_space.items()))
+            if ck not in pruned_keys:
+                return float('inf')
+            config = all_map[ck]
+            if config not in timings:
+                timings[config] = self._bench(*args, config=config, **kwargs)
+            return timings[config][0]
 
-            study = optuna.create_study(direction="minimize", sampler=self.sampler)
-            study.optimize(objective, n_trials=self.n_trials)
-            if not timings:
-                timings = {c: self._bench(*args, config=c, **kwargs) for c in pruned_configs}
-            return timings
+        study = optuna.create_study(direction="minimize", sampler=self.sampler)
+        study.optimize(objective, n_trials=self.n_trials)
+        if not timings:
+            timings = {c: self._bench(*args, config=c, **kwargs) for c in pruned_configs}
+        return timings
 
     def run(self, *args, **kwargs):
         self.nargs = dict(zip(self.arg_names, args))

@@ -262,34 +262,21 @@ def prune_gemm(configs, named_args, **kwargs):
     return pruned if pruned else configs
 
 
-@triton.autotune(
-    configs=[
-        # splits=1,2: 大 tile + BLOCK_K=64
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=3, num_warps=4),
-
-        # splits=1,2,3 通用: 中 tile
-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=4, num_warps=4),
-
-        # splits=3,4: 小 tile + BLOCK_K=64
-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32,  'BLOCK_K': 64}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32,  'BLOCK_K': 64}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32,  'BLOCK_K': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 32,  'BLOCK_K': 64}, num_stages=3, num_warps=4),
-        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 32,  'BLOCK_K': 64}, num_stages=4, num_warps=4),
-    ],
+@optuna_autotune(
+    param_space={
+        'BLOCK_M':    [2**i for i in range(4, 9)],
+        'BLOCK_N':    [2**i for i in range(4, 9)],
+        'BLOCK_K':    [2**i for i in range(5, 9)],
+        'num_warps':  [2**i for i in range(5)],
+        'num_stages': [i for i in range(1, 6)],
+        'maxnreg':    [2**i for i in range(6, 9)],
+    },
     key=['M', 'N', 'K', 'NUM_SPLITS', 'IS_INT_SLICE', 'IS_FP64_OUT'],
     prune_configs_by={'early_config_prune': prune_gemm},
+    n_trials=100,
 )
 @triton.jit
-def matmul_kernel(
+def cross_gemm_kernel(
     A_slices_ptr, B_slices_ptr, C_ptr,
     A_scales_ptr, B_scales_ptr,
     M, N, K,
@@ -439,6 +426,51 @@ def matmul_kernel(
     tl.store(C_ptr + offs_c, out.to(OUT_DTYPE), mask=mask_c)
 
 
+def cross_gemm(A_slices, B_slices, A_scales, B_scales, num_splits, output_dtype):
+    """
+    融合 Cross GEMM: 计算 C = sum_{i,j} scale_A_i * scale_B_j * (A_slice_i @ B_slice_j)
+    Args:
+        A_slices: (B, num_splits, M, K), dtype 为分片 dtype
+        B_slices: (B, num_splits, K, N), dtype 同 A_slices
+        A_scales: (B, num_splits, M), dtype=float32
+        B_scales: (B, num_splits, N), dtype=float32
+        num_splits: 分片数量
+        output_dtype: 输出 dtype (同原始输入)
+    Returns:
+        C: (B, M, N), dtype=output_dtype
+    """
+    assert A_slices.dim() == 4 and B_slices.dim() == 4
+    BN, _, M, K = A_slices.shape
+    _, _, K2, N = B_slices.shape
+    assert K == K2
+    slice_dtype = A_slices.dtype
+
+    out_accum_dtype = _select_out_accum_dtype(output_dtype)
+
+    C = torch.empty((BN, M, N), dtype=output_dtype, device=A_slices.device)
+    grid = lambda META: (
+        BN,
+        triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),
+    )
+    cross_gemm_kernel[grid](
+        A_slices, B_slices, C,
+        A_scales, B_scales,
+        M, N, K,
+        A_slices.stride(0), A_slices.stride(1), A_slices.stride(2), A_slices.stride(3),
+        B_slices.stride(0), B_slices.stride(1), B_slices.stride(2), B_slices.stride(3),
+        C.stride(0), C.stride(1), C.stride(2),
+        A_scales.stride(0), A_scales.stride(1), A_scales.stride(2),
+        B_scales.stride(0), B_scales.stride(1), B_scales.stride(2),
+        NUM_SPLITS=num_splits,
+        SLICE_DTYPE=_TORCH_TO_TL[slice_dtype],
+        OUT_ACCUM_DTYPE=_TORCH_TO_TL[out_accum_dtype],
+        OUT_DTYPE=_TORCH_TO_TL[output_dtype],
+        IS_INT_SLICE=(slice_dtype == torch.int8),
+        IS_FP64_OUT=(out_accum_dtype == torch.float64),
+    )
+
+    return C
+
 # ============================================================
 # 3. Ozaki Scheme 主流程
 # ============================================================
@@ -534,26 +566,6 @@ def ozaki_matmul(
     B_slices = B_slices_T.transpose(-1, -2)  # (BN, num_splits, K, N), 零拷贝 view
 
     # 3. Compute all cross-products and accumulate
-    C = torch.empty((BN, M, N), dtype=input_dtype, device=A.device)
-    grid = lambda META: (
-        BN,
-        triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),
-    )
-    matmul_kernel[grid](
-        A_slices, B_slices, C,
-        A_scales, B_scales,
-        M, N, K,
-        A_slices.stride(0), A_slices.stride(1), A_slices.stride(2), A_slices.stride(3),
-        B_slices.stride(0), B_slices.stride(1), B_slices.stride(2), B_slices.stride(3),
-        C.stride(0), C.stride(1), C.stride(2),
-        A_scales.stride(0), A_scales.stride(1), A_scales.stride(2),
-        B_scales.stride(0), B_scales.stride(1), B_scales.stride(2),
-        NUM_SPLITS=num_splits,
-        SLICE_DTYPE=_TORCH_TO_TL[slice_dtype],
-        OUT_ACCUM_DTYPE=_TORCH_TO_TL[out_accum_dtype],
-        OUT_DTYPE=_TORCH_TO_TL[input_dtype],
-        IS_INT_SLICE=(slice_dtype == torch.int8),
-        IS_FP64_OUT=(out_accum_dtype == torch.float64),
-    )
+    C = cross_gemm(A_slices, B_slices, A_scales, B_scales, num_splits, input_dtype)
 
     return C.view(out_shape)
