@@ -102,17 +102,35 @@ def compute_split_bits(
 # 1. 矩阵分片 (Splitting)
 # ============================================================
 
+def prune_split(configs, named_args, **kwargs):
+    pruned = []
+    for cfg in configs:
+        bm = cfg.kwargs['BLOCK_M']
+        bk = cfg.kwargs['BLOCK_K']
+        nw = cfg.num_warps
+
+        bmk2 = triton.next_power_of_2(bm * bk)
+
+        if bm * bk <= 2048:
+            if bmk2 // 512 <= nw <= bmk2 // 128:
+                pruned.append(cfg)
+
+    # print(f'pruned retained {len(pruned)} / {len(configs)} configs')
+    return pruned if pruned else configs
+
+
 # @triton.autotune(
 #     configs=_expand_configs({
 @optuna_autotune(
     param_space={
-        'BLOCK_M':    [2**i for i in range(2)],
-        'BLOCK_K':    [2**i for i in range(8, 12)],
+        'BLOCK_M':    [2**i for i in range(6)],
+        'BLOCK_K':    [2**i for i in range(6, 12)],
         'num_warps':  [2**i for i in range(5)],
         'num_stages': [i for i in range(1, 7)],
     },
     # ),
     key=['M', 'K', 'NUM_SPLITS', 'IS_INT_SLICE', 'IS_FP64_RESIDUAL'],
+    prune_configs_by={'early_config_prune': prune_split},
     n_trials=40,
 )
 @triton.jit
@@ -259,6 +277,7 @@ def prune_gemm(configs, named_args, **kwargs):
         reg  = num_splits * num_splits * bm * bn * 4
         if smem <= SMEM_LIMIT and reg <= REG_LIMIT_BYTES:
             pruned.append(cfg)
+    # print(f'pruned retained {len(pruned)} / {len(configs)} configs')
     return pruned if pruned else configs
 
 
@@ -362,10 +381,9 @@ def cross_gemm_kernel(
         offs_b = offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
 
         # 预先加载所有 B_slices 避免重复加载
-        b_tiles = [tl.zeros((BLOCK_K, BLOCK_N), dtype=SLICE_DTYPE)] * NUM_SPLITS
+        b_tiles = []
         for j in tl.static_range(NUM_SPLITS):
-            b_ptrs = B_slices_ptr + j * stride_bl + offs_b
-            b_tiles[j] = tl.load(b_ptrs, mask=mask_b, other=0).to(SLICE_DTYPE)
+            b_tiles += [tl.load(B_slices_ptr + j * stride_bl + offs_b, mask=mask_b, other=0).to(SLICE_DTYPE)]
 
         # num_splits^2 次交叉乘积
         for i in tl.static_range(NUM_SPLITS):
@@ -392,9 +410,9 @@ def cross_gemm_kernel(
                 if i == 3 and j == 3: acc33 = tl.dot(a, b, acc33, out_dtype=ACC_DTYPE)
 
     # 预先加载所有 B_scales 避免重复加载
-    sb_all = [tl.zeros((BLOCK_N,), dtype=tl.float32)] * NUM_SPLITS # scales 始终是 FP32
+    sb_all = [] # scales 始终是 FP32
     for l in tl.static_range(NUM_SPLITS):
-        sb_all[l] = tl.load(B_scales_ptr + l * stride_sbl + offs_n * stride_sbn, mask=mask_n, other=0.0) # (num_splits, BLOCK_N)
+        sb_all += [tl.load(B_scales_ptr + l * stride_sbl + offs_n * stride_sbn, mask=mask_n, other=0.0)] # (num_splits, BLOCK_N)
 
     # 外层累加器, FP64 or FP32, 不低于输入与分片精度
     out = tl.zeros((BLOCK_M, BLOCK_N), dtype=OUT_ACCUM_DTYPE)
@@ -559,11 +577,20 @@ def ozaki_matmul(
               f"splits={num_splits}, alpha={alpha}")
 
     # 2. Split
-    A_slices, A_scales = split_matrix(A3, num_splits, alpha, slice_dtype)  # A_slices: (BN, num_splits, M, K), A_scales: (BN, num_splits, M)
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+    main_stream = torch.cuda.current_stream()
 
-    B_T = B3.transpose(-1, -2)  # (BN, N, K), 零拷贝 view
-    B_slices_T, B_scales = split_matrix(B_T.contiguous(), num_splits, alpha, slice_dtype)  # B_slices_T: (BN, num_splits, N, K), B_scales: (BN, num_splits, N)
-    B_slices = B_slices_T.transpose(-1, -2)  # (BN, num_splits, K, N), 零拷贝 view
+    with torch.cuda.stream(stream_b): # 多流并行加速, 因为 B 耗时较长所以先启动
+        B_T = B3.transpose(-1, -2)  # (BN, N, K), 零拷贝 view
+        B_slices_T, B_scales = split_matrix(B_T, num_splits, alpha, slice_dtype)  # B_slices_T: (BN, num_splits, N, K), B_scales: (BN, num_splits, N)
+        B_slices = B_slices_T.transpose(-1, -2)  # (BN, num_splits, K, N), 零拷贝 view
+
+    with torch.cuda.stream(stream_a):
+        A_slices, A_scales = split_matrix(A3, num_splits, alpha, slice_dtype)  # A_slices: (BN, num_splits, M, K), A_scales: (BN, num_splits, M)
+
+    main_stream.wait_stream(stream_a)
+    main_stream.wait_stream(stream_b)
 
     # 3. Compute all cross-products and accumulate
     C = cross_gemm(A_slices, B_slices, A_scales, B_scales, num_splits, input_dtype)

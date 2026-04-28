@@ -1,6 +1,17 @@
-"""Ozaki FP64 -> INT8 性能测试脚本 (NCU 专用)"""
+"""Ozaki FP64 -> INT8 性能测试脚本"""
 import torch
+import torch.profiler
+import json
 from ozaki_triton import ozaki_matmul
+
+
+def filter_json(input_file='profile_trace.json', output_file='profile_trace_filtered.json'):
+    with open(input_file, 'r') as f:
+        data = json.load(f)
+    # filter out events with duration < 200 us
+    data['traceEvents'] = [e for e in data['traceEvents'] if 'dur' not in e or e['dur'] >= 200]
+    with open(output_file, 'w') as f:
+        json.dump(data, f, indent=4)
 
 
 def run_bench(
@@ -26,7 +37,7 @@ def run_bench(
         c = ozaki_matmul(a, b, num_splits=num_splits, slice_dtype=slice_dtype)
     torch.cuda.synchronize()
 
-    # run
+    # run ncu perf
     torch.cuda.cudart().cudaProfilerStart()
     torch.cuda.nvtx.range_push("Ozaki_Triton_GEMM")
 
@@ -36,6 +47,26 @@ def run_bench(
     torch.cuda.nvtx.range_pop()
     torch.cuda.synchronize()
     torch.cuda.cudart().cudaProfilerStop()
+
+    # run torch.profiler
+    with torch.no_grad():
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(skip_first=2, wait=2, warmup=2, active=3, repeat=1),
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=True,
+            with_modules=False,
+        ) as prof:
+            for _ in range(10):
+                c = ozaki_matmul(a, b, num_splits=num_splits, slice_dtype=slice_dtype)
+                prof.step()
+
+    prof.export_chrome_trace("profile_trace.json")
+    filter_json("profile_trace.json", "profile_trace_filtered.json")
 
     print('shape', c.shape)
     print('error', (torch.norm(c - a @ b) / torch.norm(a @ b)).item())
