@@ -271,12 +271,20 @@ def prune_gemm(configs, named_args, **kwargs):
         bm = cfg.kwargs['BLOCK_M']
         bn = cfg.kwargs['BLOCK_N']
         bk = cfg.kwargs['BLOCK_K']
-        # SMEM: num_stages 个 K-block buffer
-        smem = cfg.num_stages * (bm * bk + bk * bn) * BYTES_PER_ELEM
-        # 寄存器: num_splits^2 个 INT32/FP32 累加器
-        reg  = num_splits * num_splits * bm * bn * 4
-        if smem <= SMEM_LIMIT and reg <= REG_LIMIT_BYTES:
-            pruned.append(cfg)
+        nw = cfg.num_warps
+        maxnreg = cfg.maxnreg or 256
+
+        smem = cfg.num_stages * (bm * bk + bk * bn) * BYTES_PER_ELEM # num_stages 个 K-block buffer 占用的 SMEM 字节数
+        nreg = num_splits * num_splits * bm * bn * 4 # num_splits^2 个累加器占用的寄存器个数
+
+        if bm < 16 or bn < 16: continue # 排除小于 dot 硬件限制的 tile
+        if bm * bn < 32 * nw: continue # 排除元素数小于线程数的 tile (每个 warp 32 线程)
+        if smem > SMEM_LIMIT: continue
+        if 4 * nreg > REG_LIMIT_BYTES: continue # 每个寄存器 4 字节 (FP32/INT32)
+        if nreg // (32 * nw) + 20 > 4 * maxnreg: continue # 允许 4 倍的寄存器 spill
+
+        pruned.append(cfg)
+
     # print(f'pruned retained {len(pruned)} / {len(configs)} configs')
     return pruned if pruned else configs
 

@@ -48,7 +48,7 @@ class OptunaAutotuner(Autotuner):
             return timings[config][0]
 
         study = optuna.create_study(direction="minimize", sampler=self.sampler)
-        study.optimize(objective, n_trials=self.n_trials)
+        study.optimize(objective, n_trials=self.n_trials, catch=(Exception,))
         if not timings:
             timings = {c: self._bench(*args, config=c, **kwargs) for c in pruned_configs}
         return timings
