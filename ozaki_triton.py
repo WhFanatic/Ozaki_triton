@@ -275,7 +275,7 @@ def prune_gemm(configs, named_args, **kwargs):
         maxnreg = cfg.maxnreg or 256
 
         smem = cfg.num_stages * (bm * bk + bk * bn) * BYTES_PER_ELEM # num_stages 个 K-block buffer 占用的 SMEM 字节数
-        nreg = num_splits * num_splits * bm * bn * 4 # num_splits^2 个累加器占用的寄存器个数
+        nreg = num_splits * num_splits * bm * bn # num_splits^2 个累加器占用的寄存器个数
 
         if bm < 16 or bn < 16: continue # 排除小于 dot 硬件限制的 tile
         if bm * bn < 32 * nw: continue # 排除元素数小于线程数的 tile (每个 warp 32 线程)

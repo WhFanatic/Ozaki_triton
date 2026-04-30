@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from triton.testing import do_bench
 from concurrent.futures import ProcessPoolExecutor
-import filelock
+import multiprocessing as mp
 
 from ozaki_triton import ozaki_matmul
 
@@ -58,25 +58,32 @@ def test(num_shapes=4, output_csv="test_results.csv"):
               if 4 * 128**3 < B * M * N * K < 32 * 2048**3]
     shapes = random.choices(shapes, k=num_shapes)
 
-    # 清空旧文件
-    if os.path.exists(output_csv):
-        os.remove(output_csv)
-
     total = len(shapes) * len(scenarios)
     print(f"\nStarting test: {len(shapes)} shapes x {len(scenarios)} scenarios = {total} cases using {num_gpus} GPUs")
 
-    args_list = [(shape, scenarios, splits, i % num_gpus, output_csv)
-                 for i, shape in enumerate(shapes)]
+    args_list = [(shape, scenarios, splits, i % num_gpus) for i, shape in enumerate(shapes)]
+
+    fieldnames = ["scenario", "input_dtype", "slice_dtype", "shape", "splits",
+                  "ref_time", "ozaki_time", "speedup", "max_error", "rel_error"]
+
+    def write_to_csv(results):
+        with open(output_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(results)
 
     # 将 shapes 分发给单/多 GPU 运行测试
+    results = []
     if num_gpus > 1:
-        with ProcessPoolExecutor(max_workers=num_gpus) as pool:
-            all_results = list(pool.map(_test_one_shape, args_list))
-        results = [r for batch in all_results for r in batch]
+        with ProcessPoolExecutor(max_workers=num_gpus, mp_context=mp.get_context("spawn")) as pool:
+            for batch_results in pool.map(_test_one_shape, args_list):
+                results.extend(batch_results)
+                write_to_csv(results)
     else:
-        results = []
         for args in args_list:
-            results.extend(_test_one_shape(args))
+            batch_results = _test_one_shape(args)
+            results.extend(batch_results)
+            write_to_csv(results)
 
     print(f"Test completed. Results saved to {output_csv}")
     return results
@@ -84,7 +91,7 @@ def test(num_shapes=4, output_csv="test_results.csv"):
 
 def _test_one_shape(args):
     """单个 shape 的测试，运行在指定 GPU 上。"""
-    shape, scenarios, splits, gpu_id, output_csv = args
+    shape, scenarios, splits, gpu_id = args
 
     device = set_context(gpu_id)
 
@@ -132,17 +139,6 @@ def _test_one_shape(args):
                 "max_error":   max_err,
                 "rel_error":   rel_err,
             })
-
-    # 带文件锁追加写入 CSV
-    fieldnames = ["scenario", "input_dtype", "slice_dtype", "shape", "splits",
-                  "ref_time", "ozaki_time", "speedup", "max_error", "rel_error"]
-    with filelock.FileLock(output_csv + ".lock"):
-        write_header = not os.path.exists(output_csv) or os.path.getsize(output_csv) == 0
-        with open(output_csv, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            if write_header:
-                writer.writeheader()
-            writer.writerows(results)
 
     return results
 
