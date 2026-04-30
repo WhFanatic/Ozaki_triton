@@ -1,4 +1,5 @@
 """Ozaki Scheme 测试脚本"""
+import os
 import random
 import numpy as np
 import torch
@@ -6,8 +7,18 @@ import csv
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from triton.testing import do_bench
+from concurrent.futures import ProcessPoolExecutor
+import filelock
 
 from ozaki_triton import ozaki_matmul
+
+
+def set_context(gpu_id, use_tf32=False):
+    torch.backends.cuda.matmul.allow_tf32 = use_tf32
+    torch.backends.cudnn.allow_tf32 = use_tf32
+    torch.cuda.set_device(gpu_id)
+    device = f"cuda:{gpu_id}"
+    return device
 
 
 def test(num_shapes=4, output_csv="test_results.csv"):
@@ -28,7 +39,8 @@ def test(num_shapes=4, output_csv="test_results.csv"):
     if not torch.cuda.is_available():
         print("Test requires GPU, skipping")
         return []
-    device = "cuda"
+
+    num_gpus = torch.cuda.device_count()
 
     scenarios = [
         ("FP32 -> FP16", torch.float32, torch.float16),
@@ -39,78 +51,99 @@ def test(num_shapes=4, output_csv="test_results.csv"):
     ]
     splits = [0, 1, 2, 3, 4]
 
-    # 随机选取 shapes: (B, M, N, K)
-    shapes = [(B, M, N, K) for B in 2**np.arange(7) \
-                           for M in 2**np.arange(7, 12) \
-                           for N in 2**np.arange(7, 12) \
-                           for K in 2**np.arange(8, 13) \
+    shapes = [(B, M, N, K) for B in 2**np.arange(7)
+                           for M in 2**np.arange(7, 12)
+                           for N in 2**np.arange(7, 12)
+                           for K in 2**np.arange(8, 13)
               if 4 * 128**3 < B * M * N * K < 32 * 2048**3]
     shapes = random.choices(shapes, k=num_shapes)
 
-    results = []
+    # 清空旧文件
+    if os.path.exists(output_csv):
+        os.remove(output_csv)
+
     total = len(shapes) * len(scenarios)
-    count = 0
+    print(f"\nStarting test: {len(shapes)} shapes x {len(scenarios)} scenarios = {total} cases using {num_gpus} GPUs")
 
-    print(f"\nStarting test: {len(shapes)} shapes x {len(scenarios)} scenarios = {total} cases")
+    args_list = [(shape, scenarios, splits, i % num_gpus, output_csv)
+                 for i, shape in enumerate(shapes)]
 
-    for shape in shapes:
-        B, M, N, K = shape
-        shape_str = f"({B},{M},{N},{K})"
-
-        for name, input_dtype, slice_dtype in scenarios:
-            count += 1
-            print(f"[{count}/{total}] shape={shape_str}, scenario={name}")
-
-            # 构造输入 (统一 FP64)
-            row_scales = 10 ** ((torch.rand(M, device=device) * 2 - 1) * 2)  # [1e-2, 1e2]
-            col_scales = 10 ** ((torch.rand(N, device=device) * 2 - 1) * 2)  # [1e-2, 1e2]
-            a_fp64 = torch.randn((B, M, K), dtype=torch.float64, device=device) * row_scales[:, None]
-            b_fp64 = torch.randn((B, K, N), dtype=torch.float64, device=device) * col_scales
-            a = a_fp64.to(input_dtype)
-            b = b_fp64.to(input_dtype)
-
-            # Reference
-            C_ref = torch.nan_to_num(a @ b).double()
-            t_ref = do_bench(lambda: a @ b)
-
-            for s in splits:
-                # Naive (默认都用 FP16)
-                if s == 0:
-                    C = torch.nan_to_num(a.half() @ b.half()).double()
-                    t = do_bench(lambda: (a.half() @ b.half()).to(input_dtype))
-                    max_err = (C - C_ref).abs().max().item()
-                    rel_err = ((C - C_ref).norm() / C_ref.norm()).item()
-
-                # Ozaki 各 splits
-                else:
-                    ozaki_fn = lambda s=s: ozaki_matmul(a, b, num_splits=s, slice_dtype=slice_dtype)
-                    C = ozaki_fn().double()
-                    t = do_bench(ozaki_fn)
-                    max_err = (C - C_ref).abs().max().item()
-                    rel_err = ((C - C_ref).norm() / C_ref.norm()).item()
-
-                results.append({
-                    "scenario":    name,
-                    "input_dtype": str(input_dtype).split(".")[-1],
-                    "slice_dtype": str(slice_dtype).split(".")[-1],
-                    "shape":       shape_str,
-                    "splits":      s,
-                    "ref_time":    t_ref,
-                    "ozaki_time":  t,
-                    "speedup":     t_ref / t,
-                    "max_error":   max_err,
-                    "rel_error":   rel_err,
-                })
-
-        # 及时更新 CSV
-        fieldnames = ["scenario", "input_dtype", "slice_dtype", "shape", "splits",
-                    "ref_time", "ozaki_time", "speedup", "max_error", "rel_error"]
-        with open(output_csv, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(results)
+    # 将 shapes 分发给单/多 GPU 运行测试
+    if num_gpus > 1:
+        with ProcessPoolExecutor(max_workers=num_gpus) as pool:
+            all_results = list(pool.map(_test_one_shape, args_list))
+        results = [r for batch in all_results for r in batch]
+    else:
+        results = []
+        for args in args_list:
+            results.extend(_test_one_shape(args))
 
     print(f"Test completed. Results saved to {output_csv}")
+    return results
+
+
+def _test_one_shape(args):
+    """单个 shape 的测试，运行在指定 GPU 上。"""
+    shape, scenarios, splits, gpu_id, output_csv = args
+
+    device = set_context(gpu_id)
+
+    B, M, N, K = shape
+    results = []
+
+    for name, input_dtype, slice_dtype in scenarios:
+        print(f"[GPU {gpu_id}] shape={shape}, scenario={name}")
+
+        # 构造输入 (统一 FP64)
+        row_scales = 10 ** ((torch.rand(M, device=device) * 2 - 1) * 2)
+        col_scales = 10 ** ((torch.rand(N, device=device) * 2 - 1) * 2)
+        a_fp64 = torch.randn((B, M, K), dtype=torch.float64, device=device) * row_scales[:, None]
+        b_fp64 = torch.randn((B, K, N), dtype=torch.float64, device=device) * col_scales
+        a = a_fp64.to(input_dtype)
+        b = b_fp64.to(input_dtype)
+
+        # Reference
+        C_ref = torch.nan_to_num(a @ b).double()
+        t_ref = do_bench(lambda: a @ b)
+
+        for s in splits:
+            # Naive (默认都用 FP16)
+            if s == 0:
+                C = torch.nan_to_num(a.half() @ b.half()).double()
+                t = do_bench(lambda: (a.half() @ b.half()).to(input_dtype))
+            # Ozaki 各 splits
+            else:
+                ozaki_fn = lambda s=s: ozaki_matmul(a, b, num_splits=s, slice_dtype=slice_dtype)
+                C = ozaki_fn().double()
+                t = do_bench(ozaki_fn)
+
+            max_err = (C - C_ref).abs().max().item()
+            rel_err = ((C - C_ref).norm() / C_ref.norm()).item()
+
+            results.append({
+                "scenario":    name,
+                "input_dtype": str(input_dtype).split(".")[-1],
+                "slice_dtype": str(slice_dtype).split(".")[-1],
+                "shape":       f"{shape}",
+                "splits":      s,
+                "ref_time":    t_ref,
+                "ozaki_time":  t,
+                "speedup":     t_ref / t,
+                "max_error":   max_err,
+                "rel_error":   rel_err,
+            })
+
+    # 带文件锁追加写入 CSV
+    fieldnames = ["scenario", "input_dtype", "slice_dtype", "shape", "splits",
+                  "ref_time", "ozaki_time", "speedup", "max_error", "rel_error"]
+    with filelock.FileLock(output_csv + ".lock"):
+        write_header = not os.path.exists(output_csv) or os.path.getsize(output_csv) == 0
+        with open(output_csv, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerows(results)
+
     return results
 
 
@@ -289,9 +322,6 @@ def plot_summary(results_csv="test_results.csv", output_png="test_summary.png"):
 if __name__ == "__main__":
     random.seed(42)
     torch.manual_seed(42)
-    use_tf32 = False
-    torch.backends.cuda.matmul.allow_tf32 = use_tf32
-    torch.backends.cudnn.allow_tf32 = use_tf32
 
     test()
     show_summary()
